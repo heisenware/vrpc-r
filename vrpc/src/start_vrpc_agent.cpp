@@ -4,16 +4,14 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <bitset>
 
 #include <Rcpp.h>
 #include <json.hpp>
 #include <mqtt_client_cpp.hpp>
 #include <mqtt/setup_log.hpp>
 
-// Types
-typedef std::vector<
-    std::tuple<MQTT_NS::string_view, MQTT_NS::subscribe_options>>
-    Topics;
+using namespace std::chrono_literals;
 
 // Variables
 struct Options {
@@ -32,17 +30,32 @@ struct Options {
 std::function<void()> shutdown_handler;
 
 // Functions
-Topics generate_topics(const Options& options) {
-  Topics topics;
-  const std::string base_topic = options.domain + "/" + options.agent;
-  auto create_topic = std::make_shared<std::string>(base_topic + "/Session/__static__/__create__");
-  // In the following we will completely fake a Session class...
-  topics.push_back({*create_topic,
-                    MQTT_NS::qos::at_least_once});
-  // and fake an instance "current" reflecting the current R session
-  auto inst_topic = std::make_shared<std::string>(base_topic + "/Session/current/+");
-  topics.push_back({*inst_topic, MQTT_NS::qos::at_least_once});
-  return topics;
+std::vector<std::string> tokenize(const std::string& input,
+                                  char const* delimiters) {
+  std::vector<std::string> output;
+  std::bitset<255> delims;
+  while (*delimiters) {
+    unsigned char code = *delimiters++;
+    delims[code] = true;
+  }
+  std::string::const_iterator beg;
+  bool in_token = false;
+  for (std::string::const_iterator it = input.begin(), end = input.end();
+       it != end; ++it) {
+    if (delims[*it & 0xff]) {
+      if (in_token) {
+        output.push_back(std::string(beg, it));
+        in_token = false;
+      }
+    } else if (!in_token) {
+      beg = it;
+      in_token = true;
+    }
+  }
+  if (in_token) {
+    output.push_back(std::string(beg, input.end()));
+  }
+  return output;
 }
 
 std::string get_username() {
@@ -165,12 +178,14 @@ Options parse_arguments(const Rcpp::List& args) {
 }
 
 MQTT_NS::will create_will_message(const Options& options) {
-  auto topic = std::make_shared<std::string>(options.domain + "/" + options.agent + "/__agentInfo__");
-  auto message = std::make_shared<std::string>(
-      vrpc::json{{"status", "offline"}, {"hostname", get_hostname()}}.dump());
-  return MQTT_NS::will(MQTT_NS::buffer(MQTT_NS::string_view(topic->data(), topic->size())),
-                       MQTT_NS::buffer(MQTT_NS::string_view(*message)),
-                       MQTT_NS::qos::at_least_once | MQTT_NS::retain::yes);
+  return {MQTT_NS::allocate_buffer(options.domain + "/" + options.agent +
+                                   "/__agentInfo__"),
+          MQTT_NS::allocate_buffer(vrpc::json{
+              {"status", "offline"},
+              {"hostname",
+               get_hostname()}}.dump()),
+
+          MQTT_NS::qos::at_least_once | MQTT_NS::retain::yes};
 }
 
 // [[Rcpp::export]]
@@ -183,8 +198,6 @@ void start_vrpc_agent(const Rcpp::List& args) {
   std::cout << "Functions: " << options.functions[0] << std::endl;
   std::cout << "Client ID: " << generate_client_id(options) << std::endl;
 
-  const Topics topics = generate_topics(options);
-
   MQTT_NS::setup_log();
   boost::asio::io_context ioc;
 
@@ -196,7 +209,12 @@ void start_vrpc_agent(const Rcpp::List& args) {
   // Setup client
   c->set_client_id(generate_client_id(options));
   c->set_clean_session(true);
-  // c->set_will(create_will_message(options));
+  c->set_will(MQTT_NS::will(MQTT_NS::allocate_buffer(options.domain + "/" + options.agent +
+                                        "/__agentInfo__"),
+               MQTT_NS::allocate_buffer(vrpc::json{{"status", "offline"},
+                                                   {"hostname", get_hostname()}}
+                                            .dump()),
+               MQTT_NS::qos::at_least_once | MQTT_NS::retain::yes));
 
   // Setup handlers
   c->set_connack_handler(
@@ -216,15 +234,50 @@ void start_vrpc_agent(const Rcpp::List& args) {
   });
   c->set_publish_handler([&](MQTT_NS::optional<packet_id_t> packet_id,
                              MQTT_NS::publish_options pubopts,
-                             MQTT_NS::buffer topic_name,
-                             MQTT_NS::buffer contents) {
-    std::cout << "publish received."
+                             MQTT_NS::buffer topic, MQTT_NS::buffer contents) {
+    std::cout << "message received."
               << " dup: " << pubopts.get_dup() << " qos: " << pubopts.get_qos()
               << " retain: " << pubopts.get_retain() << std::endl;
-    if (packet_id)
-      std::cout << "packet_id: " << *packet_id << std::endl;
-    std::cout << "topic_name: " << topic_name << std::endl;
+    std::cout << "topic: " << topic << std::endl;
     std::cout << "contents: " << contents << std::endl;
+    const auto tokens = tokenize(std::string(topic), "/");
+    if (tokens.size() == 4 && tokens[3] == "__clientInfo__") {
+      std::cout << "received clientInfo" << std::endl;
+      return true;
+    }
+    if (tokens.size() != 5) {
+      std::cout << "Received message with invalid topic URI" << std::endl;
+      return true;
+    }
+    auto j = vrpc::json::parse(std::string(contents));
+    const std::string sender = j.at("sender");
+    try {
+      const std::string class_name = tokens[2];
+      const std::string instance = tokens[3];
+      const std::string method = tokens[4];
+      j["context"] = instance == "__static__" ? class_name : instance;
+      j["method"] = method;
+      vrpc::json args;
+      // It is unfortunate that VRPC's RPC protocol does not send args as
+      // array...
+      const vrpc::json& data = j["data"];
+      for (const auto& x : data.items()) {
+        args.push_back(x.value());
+      }
+      // std::cout << "data array :" << args.dump() << std::endl;
+      auto f = Rcpp::Function("json_call");
+      Rcpp::CharacterVector cv = f(method, args.dump());
+      const std::string ret = Rcpp::as<std::string>(cv);
+      if (ret.size() >= 7 && ret.substr(0, 7) == "__err__") {
+        j["data"]["e"] = ret.substr(7);
+      } else {
+        j["data"]["r"] = vrpc::json::parse(ret);
+      }
+      c->publish(sender, j.dump(), MQTT_NS::qos::at_least_once);
+    } catch (const std::exception& e) {
+      j["data"]["e"] = "Error while calling remote function: " + std::string(e.what());
+      c->publish(sender, j.dump(), MQTT_NS::qos::at_least_once);
+    }
     return true;
   });
 
@@ -232,7 +285,13 @@ void start_vrpc_agent(const Rcpp::List& args) {
   c->connect();
 
   // Disconnect (Ctrl-C)
-  shutdown_handler = [&c]() { c->disconnect(); };
+  shutdown_handler = [&]() {
+    c->publish(
+        options.domain + "/" + options.agent + "/__agentInfo__",
+        vrpc::json{{"status", "offline"}, {"hostname", get_hostname()}}.dump(),
+        MQTT_NS::qos::at_least_once | MQTT_NS::retain::yes);
+    c->disconnect(5s);
+  };
   std::signal(SIGINT, [](int) { shutdown_handler(); });
   std::signal(SIGKILL, [](int) { shutdown_handler(); });
 

@@ -1,3 +1,3 @@
 useDynLib(vrpc, .registration=TRUE)
-exportPattern("^[[:alpha:]]+")
+exportPattern("^vrpc[[:alpha:]]+")
 importFrom(Rcpp, evalCpp)
