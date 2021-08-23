@@ -29,6 +29,8 @@ struct Options {
 
 std::function<void()> shutdown_handler;
 
+std::vector<std::string> instances;
+
 // Functions
 std::vector<std::string> tokenize(const std::string& input,
                                   char const* delimiters) {
@@ -123,10 +125,13 @@ template <class T>
 void publish_class_info(const T& client, const Options& options) {
   vrpc::json j;
   j["className"] = "Session";
-  j["instances"] = std::vector<std::string>{"current"};
+  j["instances"] = instances;
   j["memberFunctions"] = options.functions;
-  j["staticFunctions"] = std::vector<std::string>{};
-  j["meta"] = vrpc::json{};
+  std::vector<std::string> v{"call"};
+  v.insert(std::end(v), std::begin(options.functions),
+           std::end(options.functions));
+  j["staticFunctions"] = v;
+  j["meta"] = vrpc::json();
   const std::string topic(options.domain + "/" + options.agent +
                           "/Session/__classInfo__");
   client->publish(topic, j.dump(),
@@ -223,7 +228,7 @@ void start_vrpc_agent(const Rcpp::List& args) {
           std::cout << "[OK]" << std::endl;
           publish_agent_info(c, options);
           c->subscribe(options.domain + "/" + options.agent + "/Session/__static__/__create__", MQTT_NS::qos::at_least_once);
-          c->subscribe(options.domain + "/" + options.agent + "/Session/current/+", MQTT_NS::qos::at_least_once);
+          c->subscribe(options.domain + "/" + options.agent + "/Session/__static__/call", MQTT_NS::qos::at_least_once);
           publish_class_info(c, options);
         }
         return true;
@@ -257,16 +262,34 @@ void start_vrpc_agent(const Rcpp::List& args) {
       const std::string method = tokens[4];
       j["context"] = instance == "__static__" ? class_name : instance;
       j["method"] = method;
+      // Extract function and args
       vrpc::json args;
-      // It is unfortunate that VRPC's RPC protocol does not send args as
-      // array...
+      Rcpp::CharacterVector cv;
       const vrpc::json& data = j["data"];
-      for (const auto& x : data.items()) {
-        args.push_back(x.value());
+      auto f = Rcpp::Function("vrpc_call");
+      // static function
+      if (instance == "__static__") {
+        if (method == "call") { // generic call
+          std::string r_function;
+          for (const auto& x : data.items()) {
+            if (x.key() == "_1") r_function = x.value();
+            else args.push_back(x.value());
+          }
+          cv = f(r_function, args.dump());
+        } else if (method == "__create__") { // instance creation
+          std::string new_instance;
+          for (const auto& x : data.items()) {
+            if (x.key() == "_1") new_instance = x.value();
+            else args.push_back(x.value());
+          }
+          instances.push_back(new_instance);
+          publish_class_info(c, options);
+        }
+        // member function
+      } else {
+        for (const auto& x : data.items()) args.push_back(x.value());
+        cv = f(method, args.dump(), instance);
       }
-      // std::cout << "data array :" << args.dump() << std::endl;
-      auto f = Rcpp::Function("json_call");
-      Rcpp::CharacterVector cv = f(method, args.dump());
       const std::string ret = Rcpp::as<std::string>(cv);
       if (ret.size() >= 7 && ret.substr(0, 7) == "__err__") {
         j["data"]["e"] = ret.substr(7);
@@ -290,7 +313,7 @@ void start_vrpc_agent(const Rcpp::List& args) {
         options.domain + "/" + options.agent + "/__agentInfo__",
         vrpc::json{{"status", "offline"}, {"hostname", get_hostname()}}.dump(),
         MQTT_NS::qos::at_least_once | MQTT_NS::retain::yes);
-    c->disconnect(5s);
+    c->disconnect(3s);
   };
   std::signal(SIGINT, [](int) { shutdown_handler(); });
   std::signal(SIGKILL, [](int) { shutdown_handler(); });

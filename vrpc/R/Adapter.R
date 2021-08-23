@@ -181,7 +181,7 @@ create_tmp_dir <- function(instance_id) {
   return(tmp)
 }
 
-forked_call <- function(object_name, args = NULL, instance_id = NULL) {
+vrpc_call <- function(object_name, args = NULL, instance_id = NULL) {
   # create tempory directory
   tmp <- create_tmp_dir(instance_id)
 

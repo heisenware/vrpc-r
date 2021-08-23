@@ -1,0 +1,31 @@
+library("vrpc")
+
+test_sys_sleep <- function(s = 2) {
+  Sys.sleep(s)
+  return(s)
+}
+
+test_foreign_package <- function() {
+  spec_category <-
+    list(
+      `$schema` = vegawidget::vega_schema(),
+      data = list(values = vegawidget::data_category),
+      mark = "bar",
+      encoding = list(
+        x = list(field = "category", type = "nominal"),
+        y = list(field = "number", type = "quantitative")
+      )
+    ) %>%
+    vegawidget::as_vegaspec()
+  return(spec_category)
+}
+
+test_plot <- function() {
+  plot(c(1, 2), c(3, 4))
+}
+
+vrpc::start_vrpc_agent(
+  broker = "mqtt://broker:1883",
+  domain = "test",
+  agent = "agent1"
+)
