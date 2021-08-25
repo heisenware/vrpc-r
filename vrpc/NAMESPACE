@@ -1,4 +1,5 @@
 useDynLib(vrpc, .registration=TRUE)
 export(start_vrpc_agent)
-export(vrpc_call)
+export(vrpc_static_call)
+export(vrpc_member_call)
 importFrom(Rcpp, evalCpp)

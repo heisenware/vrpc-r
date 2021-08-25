@@ -10,18 +10,30 @@ Rcpp::Rostream<true>&  Rcpp::Rcout = Rcpp::Rcpp_cout_get();
 Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
-// start_vrpc_agent
-void start_vrpc_agent(const Rcpp::List& options);
-RcppExport SEXP _vrpc_start_vrpc_agent(SEXP optionsSEXP) {
+// on_execution_done
+void on_execution_done(int id, const Rcpp::CharacterVector& cv);
+RcppExport SEXP _vrpc_on_execution_done(SEXP idSEXP, SEXP cvSEXP) {
 BEGIN_RCPP
     Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< const Rcpp::List& >::type options(optionsSEXP);
-    start_vrpc_agent(options);
+    Rcpp::traits::input_parameter< int >::type id(idSEXP);
+    Rcpp::traits::input_parameter< const Rcpp::CharacterVector& >::type cv(cvSEXP);
+    on_execution_done(id, cv);
+    return R_NilValue;
+END_RCPP
+}
+// start_vrpc_agent
+void start_vrpc_agent(const Rcpp::List& args);
+RcppExport SEXP _vrpc_start_vrpc_agent(SEXP argsSEXP) {
+BEGIN_RCPP
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const Rcpp::List& >::type args(argsSEXP);
+    start_vrpc_agent(args);
     return R_NilValue;
 END_RCPP
 }
 
 static const R_CallMethodDef CallEntries[] = {
+    {"_vrpc_on_execution_done", (DL_FUNC) &_vrpc_on_execution_done, 2},
     {"_vrpc_start_vrpc_agent", (DL_FUNC) &_vrpc_start_vrpc_agent, 1},
     {NULL, NULL, 0}
 };

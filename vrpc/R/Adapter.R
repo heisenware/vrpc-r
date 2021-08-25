@@ -1,9 +1,7 @@
-error_object <- NULL
-
 try_print_plot <- function(object, gfx_file) {
   out <- try(print(object), silent = TRUE)
   if (inherits(out, "try-error") &&
-      !grepl("invalid graphics state", attr(out, "condition")$message)) {
+    !grepl("invalid graphics state", attr(out, "condition")$message)) {
     stop(sprintf("Failed to print plot: %s", attr(out, "condition")$message))
   }
   if (!file.exists(gfx_file)) {
@@ -109,7 +107,16 @@ save_session <- function(instance_id, res, session_env) {
 }
 
 
-json_call <- function(object_name, string_args = NULL, instance_id = NULL) {
+json_call <- function(object_name,
+                      string_args = NULL,
+                      instance_id = NULL,
+                      call_id = NULL) {
+  error_object <- NULL
+
+  print(paste0("tempdir: ", tempdir()))
+
+  # set working directory
+  setwd(tempdir())
 
   # handles the evaluation callback
   handler <- evaluate::new_output_handler(
@@ -122,10 +129,6 @@ json_call <- function(object_name, string_args = NULL, instance_id = NULL) {
       error_object <<- e
     }
   )
-
-
-  # set working directory to the current fork execution
-  setwd(tempdir())
 
   # create environment in which to evaluate the call
   session_env <- attach_session(instance_id)
@@ -143,7 +146,7 @@ json_call <- function(object_name, string_args = NULL, instance_id = NULL) {
   if (!is.null(string_args)) {
     args <- jsonlite::fromJSON(string_args, simplifyVector = FALSE)
     if (as.logical(length(args))) {
-      for (i in 1:length(args)) {
+      for (i in seq_len(length(args))) {
         if (args[[i]] == "$object") args[[i]] <- get(".object", session_env)
       }
     }
@@ -163,11 +166,13 @@ json_call <- function(object_name, string_args = NULL, instance_id = NULL) {
   # save session
   save_session(instance_id, res, session_env)
 
-  return(list(
-    err = error_object,
-    val = get(".object", session_env),
-    gfx = extract_graphics(res)
-  ))
+  out <- ifelse(
+    is.null(error_object),
+    prepare_output(get(".object", session_env), extract_graphics(res)),
+    prepare_error(error_object)
+  )
+  if (!is.null(call_id)) on_execution_done(call_id, out)
+  return(out)
 }
 
 create_tmp_dir <- function(instance_id) {
@@ -181,21 +186,55 @@ create_tmp_dir <- function(instance_id) {
   return(tmp)
 }
 
-vrpc_call <- function(object_name, args = NULL, instance_id = NULL) {
-  # create tempory directory
-  tmp <- create_tmp_dir(instance_id)
-
-  # evaluate request in a fresh fork
-  out <- unix::eval_safe(
-    json_call(object_name, args, instance_id),
-    tmp = tmp
+prepare_error <- function(err) {
+  msg <- trimws(
+    tail(strsplit(toString(err), ": ", fixed = TRUE)[[1]], n = 1)
   )
-  if (!is.null(out$err)) return(paste0("__err__", toString(out$err)))
-  if (is.null(out$val) && !is.null(out$gfx)) return(out$gfx)
-  trial <- try(jsonlite::toJSON(out$val, auto_unbox = TRUE), silent = TRUE)
+  # as exception handling in R is underdeveloped, we will place a marker here
+  return(paste0("__err__", msg))
+}
+
+prepare_output <- function(val, gfx) {
+  if (is.null(val) && !is.null(gfx)) {
+    return(jsonlite::toJSON(gfx, auto_unbox = TRUE))
+  }
+  trial <- try(jsonlite::toJSON(val, auto_unbox = TRUE), silent = TRUE)
   if (inherits(trial, "try-error")) {
-    if (!is.null(out$gfx)) return(out$gfx)
+    if (!is.null(gfx)) {
+      return(gfx)
+    }
     return("__not_serializable__")
   }
   return(trial)
+}
+
+vrpc_static_call <- function(call_id, object_name, args) {
+
+  # evaluate request in a detached fork
+  job <- parallel::mcparallel(
+    json_call(
+      object_name = object_name,
+      string_args = args,
+      call_id = call_id
+    ),
+    detached = TRUE
+  )
+}
+
+vrpc_member_call <- function(instance_id, object_name, args) {
+  # create tempory directory
+  tmp <- create_tmp_dir(instance_id)
+
+  print(paste0("args: ", args))
+
+  # evaluate request in a fresh fork
+  out <- unix::eval_safe(
+    json_call(
+      object_name = object_name,
+      string_args = args,
+      instance_id = instance_id
+    ),
+    tmp = tmp
+  )
+  return(out)
 }

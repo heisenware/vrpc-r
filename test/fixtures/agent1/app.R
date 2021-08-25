@@ -1,6 +1,6 @@
 library("vrpc")
 
-test_sys_sleep <- function(s = 2) {
+test_sys_sleep <- function(s = 1) {
   Sys.sleep(s)
   return(s)
 }
