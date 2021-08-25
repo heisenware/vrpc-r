@@ -44,15 +44,15 @@ save_description <- function(name) {
   write.dcf(fields, file = "DESCRIPTION")
 }
 
-attach_session <- function(instance_id) {
+attach_session <- function(session_id, session_dir) {
   session_env <- new.env(parent = globalenv())
-  if (is.null(instance_id)) {
+  if (is.null(session_id)) {
     return(session_env)
   }
-  filepath <- file.path(tempdir(), ".RData")
+  filepath <- file.path(session_dir, ".RData")
   if (file.exists(filepath)) {
     load(filepath, envir = session_env)
-    env2ns(instance_id, session_env, lib = dirname(dirname(filepath)))
+    env2ns(session_id, session_env, lib = dirname(dirname(filepath)))
   }
   return(session_env)
 }
@@ -90,8 +90,8 @@ makeNamespace <- function(name, version = NULL, lib = NULL) {
   env
 }
 
-save_session <- function(instance_id, res, session_env) {
-  if (is.null(instance_id)) {
+save_session <- function(res, session_id, session_env) {
+  if (is.null(session_id)) {
     return(NULL)
   }
   save(
@@ -103,20 +103,20 @@ save_session <- function(instance_id, res, session_env) {
   saveRDS(res, file = ".REval", compress = FALSE)
   saveRDS(utils::sessionInfo(), file = ".RInfo", compress = FALSE)
   saveRDS(.libPaths(), file = ".Rlibs", compress = FALSE)
-  save_description(instance_id)
+  save_description(session_id)
 }
 
 
 json_call <- function(object_name,
+                      call_id = NULL,
                       string_args = NULL,
-                      instance_id = NULL,
-                      call_id = NULL) {
+                      session_id = NULL,
+                      session_dir = NULL) {
   error_object <- NULL
 
-  print(paste0("tempdir: ", tempdir()))
-
   # set working directory
-  setwd(tempdir())
+  print(paste0("session_dir: ", session_dir))
+  setwd(session_dir)
 
   # handles the evaluation callback
   handler <- evaluate::new_output_handler(
@@ -131,7 +131,7 @@ json_call <- function(object_name,
   )
 
   # create environment in which to evaluate the call
-  session_env <- attach_session(instance_id)
+  session_env <- attach_session(session_id, session_dir)
 
   # correctly handle pure and namespaced calls
   call_obj <- NULL
@@ -161,10 +161,10 @@ json_call <- function(object_name,
   )
 
   # set working directory again (as the evaluation may have changed it)
-  setwd(tempdir())
+  setwd(session_dir)
 
   # save session
-  save_session(instance_id, res, session_env)
+  save_session(res, session_id, session_env)
 
   out <- ifelse(
     is.null(error_object),
@@ -175,14 +175,14 @@ json_call <- function(object_name,
   return(out)
 }
 
-create_tmp_dir <- function(instance_id) {
+create_session_dir <- function(session_id) {
   tmp <- file.path(tempdir(), "vrpc")
-  if (!dir.exists(tmp)) dir.create(tmp)
-  if (is.null(instance_id)) {
+  if (is.null(session_id)) {
     tmp <- tempfile("__static__", tmpdir = tmp)
   } else {
-    tmp <- file.path(tmp, instance_id)
+    tmp <- file.path(tmp, session_id)
   }
+  if (!dir.exists(tmp)) dir.create(tmp, recursive = TRUE)
   return(tmp)
 }
 
@@ -198,43 +198,38 @@ prepare_output <- function(val, gfx) {
   if (is.null(val) && !is.null(gfx)) {
     return(jsonlite::toJSON(gfx, auto_unbox = TRUE))
   }
-  trial <- try(jsonlite::toJSON(val, auto_unbox = TRUE), silent = TRUE)
-  if (inherits(trial, "try-error")) {
+  trial1 <- try(jsonlite::toJSON(val, auto_unbox = TRUE), silent = TRUE)
+  if (inherits(trial1, "try-error")) {
     if (!is.null(gfx)) {
       return(gfx)
     }
-    return("__not_serializable__")
+    trial2 <- try(toString(val))
+    return(
+      ifelse(inherits(trial2, "try-error"), "__not_serializable__", trial2)
+    )
   }
-  return(trial)
+  return(trial1)
 }
 
-vrpc_static_call <- function(call_id, object_name, args) {
+vrpc_call <- function(function_name,
+                      string_args,
+                      call_id = NULL,
+                      instance_id = NULL) {
+  # create session_dir
+  session_dir <- create_session_dir(instance_id)
 
   # evaluate request in a detached fork
   job <- parallel::mcparallel(
     json_call(
-      object_name = object_name,
-      string_args = args,
-      call_id = call_id
+      object_name = function_name,
+      string_args = string_args,
+      call_id = call_id,
+      session_id = instance_id,
+      session_dir = session_dir
     ),
-    detached = TRUE
+    detached = !is.null(call_id)
   )
-}
-
-vrpc_member_call <- function(instance_id, object_name, args) {
-  # create tempory directory
-  tmp <- create_tmp_dir(instance_id)
-
-  print(paste0("args: ", args))
-
-  # evaluate request in a fresh fork
-  out <- unix::eval_safe(
-    json_call(
-      object_name = object_name,
-      string_args = args,
-      instance_id = instance_id
-    ),
-    tmp = tmp
+  return(
+    ifelse(is.null(call_id), parallel::mccollect(job)[[1]], TRUE)
   )
-  return(out)
 }
