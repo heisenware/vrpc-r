@@ -135,12 +135,12 @@ void publish_class_info(const T& client, const Options& options) {
   vrpc::json j;
   j["className"] = "Session";
   j["instances"] = instances;
-  j["memberFunctions"] = options.functions;
   std::vector<std::string> v{"call"};
   v.insert(std::end(v), std::begin(options.functions),
            std::end(options.functions));
+  j["memberFunctions"] = v;
   j["staticFunctions"] = v;
-  j["meta"] = vrpc::json();
+  j["meta"] = vrpc::json(nullptr);
   const std::string topic(options.domain + "/" + options.agent +
                           "/Session/__classInfo__");
   client->publish(topic, j.dump(),
@@ -258,7 +258,7 @@ void start_vrpc_agent(const Rcpp::List& args) {
           publish_agent_info(client, options);
           const std::string base_topic(options.domain + "/" + options.agent +
                                        "/Session/__static__/");
-          client->subscribe(base_topic + "__create__",
+          client->subscribe(base_topic + "__createNamed__",
                             mqtt::qos::at_least_once);
           client->subscribe(base_topic + "call", mqtt::qos::at_least_once);
           for (const auto& x : options.functions) {
@@ -320,7 +320,7 @@ void start_vrpc_agent(const Rcpp::List& args) {
               args.push_back(x.value());
           }
           vrpc_call(r_function, args.dump(), call_id);
-        } else if (method == "__create__") {
+        } else if (method == "__createNamed__") {
           // instance creation
           std::string new_instance;
           for (const auto& x : data.items()) {
@@ -333,6 +333,9 @@ void start_vrpc_agent(const Rcpp::List& args) {
                        new_instance + "/+", mqtt::qos::at_least_once);
           instances.push_back(new_instance);
           publish_class_info(client, options);
+          j["data"]["r"] = new_instance;
+          client->publish(j["sender"].get<std::string>(), j.dump(),
+                      mqtt::qos::at_least_once);
         } else {
           // specific function call
           for (const auto& x : data.items()) {
@@ -342,10 +345,20 @@ void start_vrpc_agent(const Rcpp::List& args) {
         }
       } else {
         // -- member function --
-        for (const auto& x : data.items()) {
-          args.push_back(x.value());
+        if (method == "call") {
+          // generic call
+          std::string r_function;
+          for (const auto& x : data.items()) {
+            if (x.key() == "_1") r_function = x.value();
+            else args.push_back(x.value());
+          }
+          vrpc_call(r_function, args.dump(), call_id, instance);
+        } else {
+          for (const auto& x : data.items()) {
+            args.push_back(x.value());
+          }
+          vrpc_call(method, args.dump(), call_id, instance);
         }
-        vrpc_call(method, args.dump(), call_id, instance);
       }
     } catch (const std::exception& e) {
       j["data"]["e"] =

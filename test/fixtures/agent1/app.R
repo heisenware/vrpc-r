@@ -7,7 +7,7 @@ test_sys_sleep <- function(s = 1) {
 
 test_foreign_package <- function() {
   spec_category <-
-    list(
+    vegawidget::as_vegaspec(list(
       `$schema` = vegawidget::vega_schema(),
       data = list(values = vegawidget::data_category),
       mark = "bar",
@@ -15,8 +15,7 @@ test_foreign_package <- function() {
         x = list(field = "category", type = "nominal"),
         y = list(field = "number", type = "quantitative")
       )
-    ) %>%
-    vegawidget::as_vegaspec()
+    ))
   return(spec_category)
 }
 

@@ -47,6 +47,40 @@ describe('VRPC R-Agent', () => {
     })
   })
   describe('Static calls', () => {
+    it('should report error on invalid call', async () => {
+      await assert.rejects(
+        async () =>
+          client.callStatic({
+            className: 'Session',
+            functionName: 'call',
+            args: ['does_not_exist']
+          }),
+        err => {
+          assert.strictEqual(
+            err.message,
+            'could not find function "does_not_exist"'
+          )
+          return true
+        }
+      )
+    })
+    it('should report error on invalid arguments', async () => {
+      await assert.rejects(
+        async () =>
+          client.callStatic({
+            className: 'Session',
+            functionName: 'call',
+            args: ['rnorm']
+          }),
+        err => {
+          assert.strictEqual(
+            err.message,
+            'argument "n" is missing, with no default'
+          )
+          return true
+        }
+      )
+    })
     it('should execute a generic (namespaced) call to stats::rnorm(10)', async () => {
       const ret = await client.callStatic({
         className: 'Session',
@@ -94,65 +128,49 @@ describe('VRPC R-Agent', () => {
       const call2 = client.callStatic({
         className: 'Session',
         functionName: 'test_sys_sleep',
-        args: [0.8]
+        args: [0.7]
       })
       const start = Date.now()
       const ret = await Promise.all([call1, call2])
       const duration = Date.now() - start
       assert(duration < 1000)
-      assert.deepStrictEqual(ret, [0.8, 0.8])
+      assert.deepStrictEqual(ret, [0.8, 0.7])
     })
-
-    it('should report error on invalid call', async () => {
-      await assert.rejects(
-        async () =>
-          client.callStatic({
-            className: 'Session',
-            functionName: 'call',
-            args: ['does_not_exist']
-          }),
-        err => {
-          assert.strictEqual(
-            err.message,
-            'could not find function "does_not_exist"'
-          )
-          return true
-        }
+    it('should support calling of external package functionality', async () => {
+      const ret = await client.callStatic({
+        className: 'Session',
+        functionName: 'test_foreign_package',
+        args: []
+      })
+      assert.strictEqual(typeof ret, 'object')
+      assert.strictEqual(
+        ret['$schema'],
+        'https://vega.github.io/schema/vega-lite/v4.json'
       )
     })
-    it('should report error on invalid arguments', async () => {
-      await assert.rejects(
-        async () =>
-          client.callStatic({
-            className: 'Session',
-            functionName: 'call',
-            args: ['rnorm']
-          }),
-        err => {
-          assert.strictEqual(
-            err.message,
-            'argument "n" is missing, with no default'
-          )
-          return true
-        }
-      )
+  })
+  describe('Member function calls', () => {
+    let proxy
+    it('should allow to create named instances', async () => {
+      proxy = await client.create({
+        className: 'Session',
+        instance: 'session1'
+      })
+      assert.strictEqual(typeof proxy, 'object')
     })
-
-    it.skip('should execute a call to app::run_long()', async () => {
-      const promise = client.callStatic({
-        className: 'app',
-        functionName: 'run_long',
-        args: [{ s: 2 }]
-      })
-      const ret2 = await client.callStatic({
-        className: 'stats',
-        functionName: 'rnorm',
-        args: [{ n: 100 }]
-      })
-      assert(Array.isArray(ret2))
-      assert(ret2.length === 100)
-      const ret1 = await promise
-      assert.deepStrictEqual(ret1, [2])
+    it('should allow generic calls on that instance', async () => {
+      const ret = await proxy.call('c', -2, -1, 0, 2, 6)
+      assert(Array.isArray(ret))
+      assert.strictEqual(ret.length, 5)
+      assert.strictEqual(ret[0], -2)
+    })
+    it('should allow re-using the returned object', async () => {
+      const mean = await proxy.call('mean', '$c')
+      assert.strictEqual(mean, 1)
+      const sum = await proxy.call('sum', '$c')
+      assert.strictEqual(sum, 5)
+      const vec = await proxy.call('c', '$mean', '$sum')
+      assert.deepStrictEqual(vec, [1, 5])
     })
   })
 })

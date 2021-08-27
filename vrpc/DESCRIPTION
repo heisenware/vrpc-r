@@ -7,5 +7,5 @@ Author: Dr. Burkhard C. Heisen
 Maintainer: Dr. Burkhard C. Heisen <burkhard.heisen@heisenware.com>
 Description: This package allows you to call exisiting R code from a remote location.
 License: GPL (>= 2)
-Imports: Rcpp (>= 1.0.7), jsonlite, svglite, evaluate, unix, base64enc
+Imports: Rcpp (>= 1.0.7), jsonlite, svglite, evaluate, base64enc
 LinkingTo: Rcpp, BH

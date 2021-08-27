@@ -1,7 +1,7 @@
 try_print_plot <- function(object, gfx_file) {
   out <- try(print(object), silent = TRUE)
   if (inherits(out, "try-error") &&
-    !grepl("invalid graphics state", attr(out, "condition")$message)) {
+      !grepl("invalid graphics state", attr(out, "condition")$message)) {
     stop(sprintf("Failed to print plot: %s", attr(out, "condition")$message))
   }
   if (!file.exists(gfx_file)) {
@@ -115,14 +115,16 @@ json_call <- function(object_name,
   error_object <- NULL
 
   # set working directory
-  print(paste0("session_dir: ", session_dir))
   setwd(session_dir)
+
+  # evaluation result access
+  eval_var_name <- paste0("$", object_name)
 
   # handles the evaluation callback
   handler <- evaluate::new_output_handler(
     value = function(val, visible = FALSE) {
       if (is.null(error_object)) {
-        assign(".object", val, session_env)
+        assign(eval_var_name, val, session_env)
       }
       invisible()
     }, error = function(e) {
@@ -147,7 +149,10 @@ json_call <- function(object_name,
     args <- jsonlite::fromJSON(string_args, simplifyVector = FALSE)
     if (as.logical(length(args))) {
       for (i in seq_len(length(args))) {
-        if (args[[i]] == "$object") args[[i]] <- get(".object", session_env)
+        arg <- args[[i]]
+        if (typeof(arg) == "character" && substr(arg, 1, 1) == "$") {
+          args[[i]] <- get(arg, session_env)
+        }
       }
     }
     call_obj <- as.call(c(call_obj, args))
@@ -168,10 +173,12 @@ json_call <- function(object_name,
 
   out <- ifelse(
     is.null(error_object),
-    prepare_output(get(".object", session_env), extract_graphics(res)),
+    prepare_output(get(eval_var_name, session_env), extract_graphics(res)),
     prepare_error(error_object)
   )
-  if (!is.null(call_id)) on_execution_done(call_id, out)
+  if (!is.null(call_id)) {
+    on_execution_done(call_id, out)
+  }
   return(out)
 }
 
@@ -211,7 +218,7 @@ prepare_output <- function(val, gfx) {
   return(trial1)
 }
 
-vrpc_call <- function(function_name,
+vrpc_call <- function(func_name,
                       string_args,
                       call_id = NULL,
                       instance_id = NULL) {
@@ -221,7 +228,7 @@ vrpc_call <- function(function_name,
   # evaluate request in a detached fork
   job <- parallel::mcparallel(
     json_call(
-      object_name = function_name,
+      object_name = func_name,
       string_args = string_args,
       call_id = call_id,
       session_id = instance_id,
