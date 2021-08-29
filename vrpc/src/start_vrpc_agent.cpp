@@ -135,11 +135,14 @@ void publish_class_info(const T& client, const Options& options) {
   vrpc::json j;
   j["className"] = "Session";
   j["instances"] = instances;
-  std::vector<std::string> v{"call"};
-  v.insert(std::end(v), std::begin(options.functions),
+  std::vector<std::string> s{"__createNamed__", "call"};
+  s.insert(std::end(s), std::begin(options.functions),
            std::end(options.functions));
-  j["memberFunctions"] = v;
-  j["staticFunctions"] = v;
+  j["staticFunctions"] = s;
+  std::vector<std::string> m{"call"};
+  m.insert(std::end(m), std::begin(options.functions),
+           std::end(options.functions));
+  j["memberFunctions"] = m;
   j["meta"] = vrpc::json(nullptr);
   const std::string topic(options.domain + "/" + options.agent +
                           "/Session/__classInfo__");
