@@ -8,16 +8,16 @@
 The VRPC R agent provides remote access to the entire R language functionality.
 
 Using a [VRPC client](https://vrpc.io/technology/agent-and-client), existing R
-code can be called using any other (VRPC-supported) programming language and
+code can be called by any other (VRPC-supported) programming language and
 from any remote location - e.g. directly from the browser within a
 [React](https://reactjs.org) web application.
 
 ## Technology
 
-The `vrpc` R package implements a fully fledged MQTT client in pure
+The VRPC R package implements a fully fledged MQTT client in pure
 dependency-free C++ (thanks to the great work of
 [Takatoshi Kondo](https://github.com/redboltz/mqtt_cpp)).
-Using VRPC's asynchronous [RPC protocol](https://vrpc.io/docs/remote-protocol),
+Based on VRPC's asynchronous [RPC protocol](https://vrpc.io/docs/remote-protocol),
 the MQTT client calls R functions in an asynchronous and isolated fashion.
 
 ## Teaser
@@ -97,14 +97,18 @@ straight from R and solely using R. In effect, reactive web-apps are realized
 using server-side rendering and server-side business logic for wiring input
 element updates (such as button clicks or slider moves) to output element
 updates (such as re-rendered tables or plots). Hence, the client (= browser)
-receives fully valid HTML pages for display.
+receives fully pre-rendered HTML pages for display.
 
 VRPC in contrast, does not deal with HTML nor CSS. It focuses on transporting
 data in the most performing and simple way. Visualization and reactivity can
 still be implemented but those concepts are separated and left to technology
 that is much better suited to do so than R would ever be.
 
-See for example live.vrpc.io which allows all the reactivity-wiring and
-visualization using client-side code based on [React](https://reactjs.org). It
-calls the R functions (and if needed any other technology's functions) to
-retrieve the relevant data when needed.
+See for example [VRPC Live](https://live.vrpc.io) which allows all the
+reactivity-wiring and visualization using client-side code based on
+[React](https://reactjs.org). It calls the R functions (and if needed any other
+technology's functions) to retrieve the relevant data when needed.
+
+Or implement you own React application and use
+[react-vrpc](https://www.npmjs.com/package/react-vrpc) for backend connectivity
+and state management.
