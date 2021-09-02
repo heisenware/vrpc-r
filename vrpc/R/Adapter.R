@@ -59,7 +59,8 @@ json_call <- function(object_name,
         assign(eval_var_name, val, eval_env)
       }
       invisible()
-    }, error = function(e) {
+    },
+    error = function(e) {
       error_object <<- e
     }
   )
@@ -159,7 +160,7 @@ prepare_output <- function(val, gfx) {
     if (!is.null(gfx)) {
       return(gfx)
     }
-    trial2 <- try(toString(val))
+    trial2 <- try(jsonlite::serializeJSON(val), silent = TRUE)
     return(
       ifelse(inherits(trial2, "try-error"), "__not_serializable__", trial2)
     )
@@ -167,7 +168,7 @@ prepare_output <- function(val, gfx) {
   return(trial1)
 }
 
-extract_graphics <- function(evaluation, args) {
+extract_graphics <- function(evaluation) {
   index <- vapply(evaluation, inherits, logical(1), "recordedplot")
   plots <- evaluation[index]
   if (length(plots) < 1) {
