@@ -5,7 +5,7 @@ on_execution_done <- function(id, cv) {
     invisible(.Call(`_vrpc_on_execution_done`, id, cv))
 }
 
-start_vrpc_agent <- function(broker = "mqtt://localhost:1883",
+start_vrpc_agent <- function(broker = "mqtt://vrpc.io:1883",
                              domain = "public.vrpc",
                              agent = NULL,
                              username = NULL,

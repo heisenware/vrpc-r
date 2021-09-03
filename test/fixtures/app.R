@@ -1,4 +1,19 @@
-library("vrpc")
+library(vrpc)
+
+dataset <- NULL
+
+select_dataset <- function(name) {
+  dataset <<- switch(name,
+    "rock" = rock,
+    "pressure" = pressure,
+    "cars" = cars
+  )
+  return(TRUE)
+}
+
+get_table <- function(n) {
+  head(dataset, n = n)
+}
 
 test_sys_sleep <- function(s = 1) {
   Sys.sleep(s)

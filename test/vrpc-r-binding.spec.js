@@ -27,16 +27,15 @@ describe('VRPC R-Agent', () => {
         client.on(
           'class',
           ({ className, staticFunctions, memberFunctions }) => {
-            console.log(className, staticFunctions, memberFunctions)
             if (className !== 'Session') return
-            assert(memberFunctions.includes('test_sys_sleep'))
-            assert(memberFunctions.includes('test_foreign_package'))
-            assert(memberFunctions.includes('test_plot'))
-
-            assert(staticFunctions.includes('test_sys_sleep'))
-            assert(staticFunctions.includes('test_foreign_package'))
-            assert(staticFunctions.includes('test_plot'))
-            assert(staticFunctions.includes('call'))
+            for (const x of [staticFunctions, memberFunctions]) {
+              assert(x.includes('select_dataset'))
+              assert(x.includes('get_table'))
+              assert(x.includes('test_sys_sleep'))
+              assert(x.includes('test_foreign_package'))
+              assert(x.includes('test_plot'))
+              assert(x.includes('call'))
+            }
             resolve()
           }
         )
@@ -150,27 +149,56 @@ describe('VRPC R-Agent', () => {
     })
   })
   describe('Member function calls', () => {
-    let proxy
+    let proxy1
+    let proxy2
     it('should allow to create named instances', async () => {
-      proxy = await client.create({
+      proxy1 = await client.create({
         className: 'Session',
         instance: 'session1'
       })
-      assert.strictEqual(typeof proxy, 'object')
+      proxy2 = await client.create({
+        className: 'Session',
+        instance: 'session2'
+      })
+      assert.strictEqual(typeof proxy1, 'object')
+      assert.strictEqual(typeof proxy2, 'object')
     })
     it('should allow generic calls on that instance', async () => {
-      const ret = await proxy.call('c', -2, -1, 0, 2, 6)
+      const ret = await proxy1.call('c', -2, -1, 0, 2, 6)
       assert(Array.isArray(ret))
       assert.strictEqual(ret.length, 5)
       assert.strictEqual(ret[0], -2)
     })
     it('should allow re-using the returned object', async () => {
-      const mean = await proxy.call('mean', '$c')
+      const mean = await proxy1.call('mean', '$c')
       assert.strictEqual(mean, 1)
-      const sum = await proxy.call('sum', '$c')
+      const sum = await proxy1.call('sum', '$c')
       assert.strictEqual(sum, 5)
-      const vec = await proxy.call('c', '$mean', '$sum')
+      const vec = await proxy1.call('c', '$mean', '$sum')
       assert.deepStrictEqual(vec, [1, 5])
+    })
+    it('should keep state of global variables', async () => {
+      assert(await proxy1.select_dataset('rock'))
+      const rockRow = await proxy1.get_table(1)
+      assert.deepStrictEqual(rockRow, [
+        { area: 4990, peri: 2791.9, perm: 6.3, shape: 0.0903 }
+      ])
+      assert(await proxy1.select_dataset('cars'))
+      const carRows = await proxy1.get_table(2)
+      assert.deepStrictEqual(carRows, [
+        { dist: 2, speed: 4 },
+        { dist: 10, speed: 4 }
+      ])
+    })
+    it('should cleanly separate state of different instances', async () => {
+      assert(await proxy1.select_dataset('pressure'))
+      const pressureRow = await proxy1.get_table(1)
+      assert(await proxy2.select_dataset('cars'))
+      const carRow = await proxy2.get_table(1)
+      assert.deepStrictEqual(pressureRow, [
+        { pressure: 0.0002, temperature: 0 }
+      ])
+      assert.deepStrictEqual(carRow, [{ dist: 2, speed: 4 }])
     })
   })
 })
