@@ -4,7 +4,7 @@ RUN Rscript -e 'install.packages(c("Rcpp", "BH", "jsonlite", "svglite", "evaluat
 
 # for the tests to work (not needed for vrpc functionality)
 RUN apt-get -y install libxml2-dev
-RUN Rscript -e 'install.packages(c("shiny", "vegawidget"))'
+RUN Rscript -e 'install.packages(c("vegawidget"))'
 
 COPY vrpc /packages/vrpc
 WORKDIR /packages

@@ -30,7 +30,7 @@ services:
     hostname: broker
 
   agent1:
-    build: ../
+    image: heisenware/vrpc-r-agent:latest
     hostname: agent1
     volumes:
       - ./fixtures:/app
