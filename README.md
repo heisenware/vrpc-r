@@ -4,7 +4,7 @@
 [![Semver](https://img.shields.io/badge/semver-2.0.0-blue)](https://semver.org/spec/v2.0.0.html)
 [![GitHub Releases](https://img.shields.io/github/tag/heisenware/vrpc-r-agent.svg)](https://github.com/heisenware/vrpc-r-agent/tag)
 [![GitHub Issues](https://img.shields.io/github/issues/heisenware/vrpc-r-agent.svg)](http://github.com/heisenware/vrpc-r-agent/issues)
-![ci](https://github.com/<OWNER>/<REPOSITORY>/actions/workflows/ci/badge.svg)
+![ci](https://github.com/<OWNER>/<REPOSITORY>/actions/workflows/ci.yml/badge.svg)
 
 The VRPC R agent provides remote access to the entire R language functionality.
 
