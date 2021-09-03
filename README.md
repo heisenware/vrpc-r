@@ -63,6 +63,13 @@ Run in another terminal:
 node index.js <agentName> # will print: "Hello, world!"
 ```
 
+> **DISCLAIMER**
+>
+> At this very early time of this brand-new repository the VRPC package is not
+> (yet) available via CRAN. You may still run the example utilizing the
+> all-inclusive docker image `heisenware/vrpc-r-agent` (see shipped Dockerfile)
+> or by building the vrpc package your own (`R CMD INSTALL --preclean vrpc`).
+
 ## Features
 
 - lightning fast using plain C++-based MQTT with zero protocol overhead
