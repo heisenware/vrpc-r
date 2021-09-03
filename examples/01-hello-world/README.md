@@ -3,7 +3,7 @@
 This - obviously - is the most basic example. We are calling a function in R
 and receive its return value.
 
-## Step 1
+## Step 1: Prepare R code to be called remotely
 
 Let's pretend we wanted to remotely call this very simple R code:
 
@@ -14,7 +14,6 @@ greet <- function(whom) {
 ```
 
 Then all we have to do is to load the `vrpc` library and add a single line:
-
 
 *app.R*
 
@@ -38,7 +37,7 @@ a VRPC agent will be created which connects to the vrpc.io cloud and
 keeps listening for incoming instructions under the public and free domain
 "public.vrpc".
 
-## Step 2
+## Step 2: Use a node.js client to call the R code
 
 Having started the agent, we can now call the code from any remote location
 using any VRPC-supported programming language.
