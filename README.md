@@ -116,4 +116,4 @@ and state management.
 ## Examples
 
 - [Hello World Example](examples/01-hello-world/README.md)
-- [State Management Example](examples/01-hello-world/README.md)
+- [State Management Example](examples/02-stateful/README.md)
