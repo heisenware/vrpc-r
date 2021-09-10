@@ -858,19 +858,6 @@ public:
     }
 
     /**
-     * @brief Set async notify flag
-     * @param async send packet
-     *
-     * MQTT protocol requests sending connack/disconnect packet with error reason code if some error happens.<BR>
-     * This function choose sync/async connack/disconnect.<BR>
-     * MQTT protocol requests sending pubrec even if the corresponding publish has already been handled.<BR>
-     * This function choose sync/async pubrec.<BR>
-     */
-    void set_async_notify(bool async = true) {
-        async_notify_ = async;
-    }
-
-    /**
      * @brief Set topic alias send auto mapping enable flag
      * @param b set value
      *
@@ -909,12 +896,7 @@ public:
      */
     void set_topic_alias_maximum(topic_alias_t max) {
         LockGuard<Mutex> lck (topic_alias_recv_mtx_);
-        if (max == 0) {
-            topic_alias_recv_ = nullopt;
-        }
-        else {
-            topic_alias_recv_.emplace(max);
-        }
+        topic_alias_recv_.emplace(max);
     }
 
     /**
@@ -1055,6 +1037,15 @@ public:
             << "force_disconnect";
 
         shutdown(socket());
+
+        {
+            LockGuard<Mutex> lck (topic_alias_send_mtx_);
+            if (topic_alias_send_) topic_alias_send_.value().clear();
+        }
+        {
+            LockGuard<Mutex> lck (topic_alias_recv_mtx_);
+            if (topic_alias_recv_) topic_alias_recv_.value().clear();
+        }
     }
 
     /**
@@ -2201,7 +2192,7 @@ public:
      */
     void async_disconnect(
         v5::disconnect_reason_code reason,
-        v5::properties props = {},
+        v5::properties props,
         async_handler_t func = {}
     ) {
         MQTT_LOG("mqtt_api", info)
@@ -4311,7 +4302,6 @@ public:
     template <typename Iterator>
     std::enable_if_t< std::is_convertible<typename Iterator::value_type, char>::value >
     restore_serialized_message(Iterator b, Iterator e) {
-        BOOST_ASSERT(version_ == protocol_version::v3_1_1);
         static_assert(
             std::is_same<
                 typename std::iterator_traits<Iterator>::iterator_category,
@@ -4374,7 +4364,6 @@ public:
      *        An object that stays alive (but is moved with force_move()) until the stored message is sent.
      */
     void restore_serialized_message(basic_publish_message<PacketIdBytes> msg, any life_keeper = {}) {
-        BOOST_ASSERT(version_ == protocol_version::v3_1_1);
         auto packet_id = msg.packet_id();
         qos qos_value = msg.get_qos();
         LockGuard<Mutex> lck (store_mtx_);
@@ -4412,7 +4401,6 @@ public:
      * @param msg pubrel message.
      */
     void restore_serialized_message(basic_pubrel_message<PacketIdBytes> msg, any life_keeper = {}) {
-        BOOST_ASSERT(version_ == protocol_version::v3_1_1);
         auto packet_id = msg.packet_id();
         LockGuard<Mutex> lck (store_mtx_);
         if (pid_man_.register_id(packet_id)) {
@@ -4451,7 +4439,6 @@ public:
     template <typename Iterator>
     std::enable_if_t< std::is_convertible<typename Iterator::value_type, char>::value >
     restore_v5_serialized_message(Iterator b, Iterator e) {
-        BOOST_ASSERT(version_ == protocol_version::v5);
         if (b == e) return;
 
         auto fixed_header = static_cast<std::uint8_t>(*b);
@@ -4496,7 +4483,6 @@ public:
      *        An object that stays alive (but is moved with force_move()) until the stored message is sent.
      */
     void restore_v5_serialized_message(v5::basic_publish_message<PacketIdBytes> msg, any life_keeper = {}) {
-        BOOST_ASSERT(version_ == protocol_version::v5);
         BOOST_ASSERT(!msg.topic().empty());
         auto packet_id = msg.packet_id();
         auto qos = msg.get_qos();
@@ -4537,7 +4523,6 @@ public:
      *        An object that stays alive (but is moved with force_move()) until the stored message is sent.
      */
     void restore_v5_serialized_message(v5::basic_pubrel_message<PacketIdBytes> msg, any life_keeper = {}) {
-        BOOST_ASSERT(version_ == protocol_version::v5);
         auto packet_id = msg.packet_id();
         LockGuard<Mutex> lck (store_mtx_);
         if (pid_man_.register_id(packet_id)) {
@@ -4598,27 +4583,18 @@ public:
 
     void send_store_message(basic_store_message_variant<PacketIdBytes> msg, any life_keeper) {
         auto publish_proc =
-            [&](auto msg, auto const& serialize, auto const& receive_maximum_proc) {
-                auto msg_lk = apply_topic_alias(msg, life_keeper);
-                if (maximum_packet_size_send_ < size<PacketIdBytes>(std::get<0>(msg_lk))) {
-                    throw packet_size_error();
-                }
+            [&](auto msg, auto const& serialize) {
                 preprocess_publish_message(
                     msg,
                     life_keeper,
                     serialize,
-                    receive_maximum_proc,
                     true // register packet_id
                 );
-                do_sync_write(force_move(std::get<0>(msg_lk)));
+                do_sync_write(force_move(msg));
             };
 
         auto pubrel_proc =
             [&](auto msg, auto const& serialize) {
-                if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                    throw packet_size_error();
-                }
-
                 auto packet_id = msg.packet_id();
 
                 LockGuard<Mutex> lck (store_mtx_);
@@ -4641,11 +4617,7 @@ public:
                     MQTT_LOG("mqtt_api", info)
                         << MQTT_ADD_VALUE(address, this)
                         << "send_store_message publish v3.1.1";
-                    publish_proc(
-                        force_move(m),
-                        &endpoint::on_serialize_publish_message,
-                        [] (auto&&) { return true; }
-                    );
+                    publish_proc(force_move(m), &endpoint::on_serialize_publish_message);
                 },
                 [this, &pubrel_proc](v3_1_1::basic_pubrel_message<PacketIdBytes>& m) {
                     MQTT_LOG("mqtt_api", info)
@@ -4657,30 +4629,12 @@ public:
                     MQTT_LOG("mqtt_api", info)
                         << MQTT_ADD_VALUE(address, this)
                         << "send_store_message publish v5";
-                    publish_proc(
-                        force_move(m),
-                        &endpoint::on_serialize_v5_publish_message,
-                        [this] (v5::basic_publish_message<PacketIdBytes>&& msg) {
-                            if (publish_send_count_.load() == publish_send_max_) {
-                                LockGuard<Mutex> lck (publish_send_queue_mtx_);
-                                publish_send_queue_.emplace_back(force_move(msg));
-                                return false;
-                            }
-                            else {
-                                MQTT_LOG("mqtt_impl", trace)
-                                    << MQTT_ADD_VALUE(address, this)
-                                    << "increment publish_send_count_:" << publish_send_count_.load();
-                                ++publish_send_count_;
-                            }
-                            return true;
-                        }
-                    );
+                    publish_proc(force_move(m), &endpoint::on_serialize_v5_publish_message);
                 },
                 [this, &pubrel_proc](v5::basic_pubrel_message<PacketIdBytes>& m) {
                     MQTT_LOG("mqtt_api", info)
                         << MQTT_ADD_VALUE(address, this)
                         << "send_store_message pubrel v5";
-                    resend_pubrel_.insert(m.packet_id());
                     pubrel_proc(force_move(m), &endpoint::on_serialize_v5_pubrel_message);
                 }
             ),
@@ -4690,43 +4644,18 @@ public:
 
     void async_send_store_message(basic_store_message_variant<PacketIdBytes> msg, any life_keeper, async_handler_t func) {
         auto publish_proc =
-            [&](auto msg, auto const& serialize, auto const& receive_maximum_proc) {
-                auto msg_lk = apply_topic_alias(msg, life_keeper);
-                if (maximum_packet_size_send_ < size<PacketIdBytes>(std::get<0>(msg_lk))) {
-                    socket_->post(
-                        [func = force_move(func)] {
-                            if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                        }
-                    );
-                    return;
-                }
+            [&](auto msg, auto const& serialize) {
                 preprocess_publish_message(
                     msg,
                     life_keeper,
                     serialize,
-                    receive_maximum_proc,
                     true // register packet_id
                 );
-                do_async_write(
-                    force_move(std::get<0>(msg_lk)),
-                    [func = force_move(func), life_keeper = force_move(std::get<1>(msg_lk))]
-                    (error_code ec) {
-                        if (func) func(ec);
-                    }
-                );
+                do_async_write(force_move(msg), force_move(func));
             };
 
         auto pubrel_proc =
             [&](auto msg, auto const& serialize) {
-                if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                    socket_->post(
-                        [func = force_move(func)] {
-                            if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                        }
-                    );
-                    return;
-                }
-
                 auto packet_id = msg.packet_id();
 
                 LockGuard<Mutex> lck (store_mtx_);
@@ -4749,11 +4678,7 @@ public:
                     MQTT_LOG("mqtt_api", info)
                         << MQTT_ADD_VALUE(address, this)
                         << "async_send_store_message publish v3.1.1";
-                    publish_proc(
-                        force_move(m),
-                        &endpoint::on_serialize_publish_message,
-                        [] (auto&&) { return true; }
-                    );
+                    publish_proc(force_move(m), &endpoint::on_serialize_publish_message);
                 },
                 [this, &pubrel_proc](v3_1_1::basic_pubrel_message<PacketIdBytes>& m) {
                     MQTT_LOG("mqtt_api", info)
@@ -4761,34 +4686,16 @@ public:
                         << "async_send_store_message pubrel v3.1.1";
                     pubrel_proc(force_move(m), &endpoint::on_serialize_pubrel_message);
                 },
-                [this, &publish_proc, &func](v5::basic_publish_message<PacketIdBytes>& m) {
+                [this, &publish_proc](v5::basic_publish_message<PacketIdBytes>& m) {
                     MQTT_LOG("mqtt_api", info)
                         << MQTT_ADD_VALUE(address, this)
                         << "async_send_store_message publish v5";
-                    publish_proc(
-                        force_move(m),
-                        &endpoint::on_serialize_v5_publish_message,
-                        [this, func] (v5::basic_publish_message<PacketIdBytes>&& msg) {
-                            if (publish_send_count_.load() == publish_send_max_) {
-                                LockGuard<Mutex> lck (publish_send_queue_mtx_);
-                                publish_send_queue_.emplace_back(force_move(msg), func);
-                                return false;
-                            }
-                            else {
-                                MQTT_LOG("mqtt_impl", trace)
-                                    << MQTT_ADD_VALUE(address, this)
-                                    << "increment publish_send_count_:" << publish_send_count_.load();
-                                ++publish_send_count_;
-                            }
-                            return true;
-                        }
-                    );
+                    publish_proc(force_move(m), &endpoint::on_serialize_v5_publish_message);
                 },
                 [this, &pubrel_proc](v5::basic_pubrel_message<PacketIdBytes>& m) {
                     MQTT_LOG("mqtt_api", info)
                         << MQTT_ADD_VALUE(address, this)
                         << "async_send_store_message pubrel v5";
-                    resend_pubrel_.insert(m.packet_id());
                     pubrel_proc(force_move(m), &endpoint::on_serialize_v5_pubrel_message);
                 }
             ),
@@ -4883,32 +4790,6 @@ public:
         pingresp_timeout_ = force_move(tim);
     }
 
-     /**
-     * @brief Set maximum packet size that endpoint can receive
-     * If the endpoint is client, then it sends as CONNECT packet property.
-     * If the endpoint is server, then it sends as CONNACK packet property.
-     * If property is manually set, then maximum_packet_size_recv_ is overwritten by the property.
-     *
-     * @param size maximum packet size
-     */
-    void set_maximum_packet_size_recv(std::size_t size) {
-        BOOST_ASSERT(size > 0 && size <= packet_size_no_limit);
-        maximum_packet_size_recv_ = size;
-    }
-
-     /**
-     * @brief Set receive maximum that endpoint can receive
-     * If the endpoint is client, then it sends as CONNECT packet property.
-     * If the endpoint is server, then it sends as CONNACK packet property.
-     * If property is manually set, then publish_recv_max_ is overwritten by the property.
-     *
-     * @param size maximum packet size
-     */
-    void set_receive_maximum(receive_maximum_t val) {
-        BOOST_ASSERT(val > 0);
-        publish_recv_max_ = val;
-    }
-
 protected:
 
     /**
@@ -4942,6 +4823,14 @@ protected:
                 socket_->close(ignored_ec);
             }
         }
+        {
+            LockGuard<Mutex> lck (topic_alias_send_mtx_);
+            if (topic_alias_send_) topic_alias_send_.value().clear();
+        }
+        {
+            LockGuard<Mutex> lck (topic_alias_recv_mtx_);
+            if (topic_alias_recv_) topic_alias_recv_.value().clear();
+        }
         if (disconnect_requested_) {
             disconnect_requested_ = false;
             connect_requested_ = false;
@@ -4971,160 +4860,6 @@ protected:
     }
 
 private:
-    enum class connection_type {
-        client,
-        server
-    };
-
-    void update_values_and_props_on_start_connection(v5::properties& props) {
-        // Check properties and overwrite the values by properties
-        std::size_t topic_alias_maximum_count = 0;
-        std::size_t maximum_packet_size_count = 0;
-        std::size_t receive_maximum_count = 0;
-        v5::visit_props(
-            props,
-            [&](v5::property::topic_alias_maximum const& p) {
-                if (++topic_alias_maximum_count == 2) {
-                    throw protocol_error();
-                    return;
-                }
-                LockGuard<Mutex> lck (topic_alias_recv_mtx_);
-                if (p.val() == 0) {
-                    topic_alias_recv_ = nullopt;
-                }
-                else {
-                    topic_alias_recv_.emplace(p.val());
-                }
-            },
-            [&](v5::property::maximum_packet_size const& p) {
-                if (++maximum_packet_size_count == 2) {
-                    throw protocol_error();
-                    return;
-                }
-                if (p.val() == 0) {
-                    throw protocol_error();
-                    return;
-                }
-                maximum_packet_size_recv_ = p.val();
-            },
-            [&](v5::property::receive_maximum const& p) {
-                if (++receive_maximum_count == 2) {
-                    throw protocol_error();
-                    return;
-                }
-                if (p.val() == 0) {
-                    throw protocol_error();
-                    return;
-                }
-                publish_recv_max_ = p.val();
-            },
-            [](auto&&) {
-            }
-        );
-
-        // If property is not set, then set property automatically.
-        if (topic_alias_maximum_count == 0) {
-            LockGuard<Mutex> lck (topic_alias_recv_mtx_);
-            if (topic_alias_recv_ && topic_alias_recv_.value().max() != 0) {
-                props.emplace_back(
-                    MQTT_NS::v5::property::topic_alias_maximum(topic_alias_recv_.value().max())
-                );
-            }
-        }
-        if (maximum_packet_size_count == 0) {
-            if (maximum_packet_size_recv_ != packet_size_no_limit) {
-                props.emplace_back(
-                    MQTT_NS::v5::property::maximum_packet_size(static_cast<std::uint32_t>(maximum_packet_size_recv_))
-                );
-            }
-        }
-        if (receive_maximum_count == 0) {
-            if (publish_recv_max_ != receive_maximum_max) {
-                props.emplace_back(
-                    MQTT_NS::v5::property::receive_maximum(static_cast<receive_maximum_t>(publish_recv_max_))
-                );
-            }
-        }
-    }
-
-    bool set_values_from_props_on_connection(connection_type type, v5::properties const& props) {
-
-#define MQTT_SEND_ERROR(rc) \
-        switch (type) {                                                 \
-        case connection_type::client:                                   \
-            send_error_disconnect(v5::disconnect_reason_code::rc);      \
-            break;                                                      \
-        case connection_type::server:                                   \
-            send_error_connack(v5::connect_reason_code::rc);            \
-            break;                                                      \
-        default:                                                        \
-            BOOST_ASSERT(false);                                        \
-            break;                                                      \
-        }
-
-        bool ret = true;
-        std::size_t topic_alias_maximum_count = 0;
-        std::size_t maximum_packet_size_count = 0;
-        std::size_t receive_maximum_count = 0;
-        v5::visit_props(
-            props,
-            [&](v5::property::topic_alias_maximum const& p) {
-                if (++topic_alias_maximum_count == 2) {
-                    MQTT_SEND_ERROR(protocol_error);
-                    ret = false;
-                    return;
-                }
-                if (topic_alias_maximum_count > 2) {
-                    ret = false;
-                    return;
-                }
-                if (p.val() > 0) {
-                    LockGuard<Mutex> lck (topic_alias_send_mtx_);
-                    topic_alias_send_.emplace(p.val());
-                }
-            },
-            [&](v5::property::maximum_packet_size const& p) {
-                if (++maximum_packet_size_count == 2) {
-                    MQTT_SEND_ERROR(protocol_error);
-                    ret = false;
-                    return;
-                }
-                if (maximum_packet_size_count > 2) {
-                    ret = false;
-                    return;
-                }
-                if (p.val() == 0) {
-                    MQTT_SEND_ERROR(protocol_error);
-                    ret = false;
-                    return;
-                }
-                maximum_packet_size_send_ = p.val();
-            },
-            [&](v5::property::receive_maximum const& p) {
-                if (++receive_maximum_count == 2) {
-                    MQTT_SEND_ERROR(protocol_error);
-                    ret = false;
-                    return;
-                }
-                if (receive_maximum_count > 2) {
-                    ret = false;
-                    return;
-                }
-                if (p.val() == 0) {
-                    MQTT_SEND_ERROR(protocol_error);
-                    ret = false;
-                    return;
-                }
-                publish_send_max_ = p.val();
-            },
-            [](auto&&) {
-            }
-        );
-#undef MQTT_SEND_ERROR
-
-        return ret;
-    }
-
     bool check_transferred_length(
         std::size_t bytes_transferred,
         std::size_t bytes_expected) {
@@ -5159,48 +4894,6 @@ private:
 
         boost::system::error_code ec;
         socket.lowest_layer().close(ec);
-    }
-
-    void send_error_disconnect(v5::disconnect_reason_code rc) {
-        if (async_notify_) {
-            auto sp = this->shared_from_this();
-            async_disconnect(
-                rc,
-                v5::properties{},
-                [sp = force_move(sp)] (error_code) mutable {
-                    sp->socket().post(
-                        [sp = force_move(sp)] {
-                            sp->force_disconnect();
-                        }
-                    );
-                }
-            );
-        }
-        else {
-            disconnect(rc);
-            force_disconnect();
-        }
-    }
-
-    void send_error_connack(v5::connect_reason_code rc) {
-        if (async_notify_) {
-            auto sp = this->shared_from_this();
-            async_connack(
-                false,
-                rc,
-                [sp = force_move(sp)] (error_code) mutable {
-                    sp->socket().post(
-                        [sp = force_move(sp)] {
-                            sp->force_disconnect();
-                        }
-                    );
-                }
-            );
-        }
-        else {
-            connack(false, rc);
-            force_disconnect();
-        }
     }
 
     class send_buffer {
@@ -5249,11 +4942,6 @@ private:
         }
         any const& life_keeper() const {
             return life_keeper_;
-        }
-        bool is_publish() const {
-            return
-                expected_control_packet_type_ == control_packet_type::puback ||
-                expected_control_packet_type_ == control_packet_type::pubrec;
         }
 
     private:
@@ -5880,7 +5568,6 @@ private:
             (this_type_sp&& self, any&& session_life_keeper, parse_handler_variant var, buffer buf) mutable {
                 auto property_length = variant_get<std::size_t>(var);
                 if (property_length > remaining_length_) {
-                    send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                     call_protocol_error_handlers();
                     return;
                 }
@@ -6032,7 +5719,6 @@ private:
         static constexpr std::size_t length_bytes = 2;
 
         if (property_length_rest == 0) {
-            send_error_disconnect(v5::disconnect_reason_code::protocol_error);
             call_protocol_error_handlers();
             return;
         }
@@ -6041,7 +5727,6 @@ private:
         case v5::property::id::payload_format_indicator: {
             static constexpr std::size_t len = 1;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6075,7 +5760,6 @@ private:
         case v5::property::id::message_expiry_interval: {
             static constexpr std::size_t len = 4;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6223,7 +5907,6 @@ private:
         case v5::property::id::session_expiry_interval: {
             static constexpr std::size_t len = 4;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6286,7 +5969,6 @@ private:
         case v5::property::id::server_keep_alive: {
             static constexpr std::size_t len = 2;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6376,7 +6058,6 @@ private:
         case v5::property::id::request_problem_information: {
             static constexpr std::size_t len = 1;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6410,7 +6091,6 @@ private:
         case v5::property::id::will_delay_interval: {
             static constexpr std::size_t len = 4;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6444,7 +6124,6 @@ private:
         case v5::property::id::request_response_information: {
             static constexpr std::size_t len = 1;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6562,7 +6241,6 @@ private:
         case v5::property::id::receive_maximum: {
             static constexpr std::size_t len = 2;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6596,7 +6274,6 @@ private:
         case v5::property::id::topic_alias_maximum: {
             static constexpr std::size_t len = 2;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6630,7 +6307,6 @@ private:
         case v5::property::id::topic_alias: {
             static constexpr std::size_t len = 2;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6664,7 +6340,6 @@ private:
         case v5::property::id::maximum_qos: {
             static constexpr std::size_t len = 1;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6698,7 +6373,6 @@ private:
         case v5::property::id::retain_available: {
             static constexpr std::size_t len = 1;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6781,7 +6455,6 @@ private:
         case v5::property::id::maximum_packet_size: {
             static constexpr std::size_t len = 4;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6815,7 +6488,6 @@ private:
         case v5::property::id::wildcard_subscription_available: {
             static constexpr std::size_t len = 1;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6849,7 +6521,6 @@ private:
         case v5::property::id::subscription_identifier_available: {
             static constexpr std::size_t len = 1;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -6883,7 +6554,6 @@ private:
         case v5::property::id::shared_subscription_available: {
             static constexpr std::size_t len = 1;
             if (property_length_rest < len) {
-                send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                 call_protocol_error_handlers();
                 return;
             }
@@ -7143,19 +6813,6 @@ private:
                     password_ = force_move(variant_get<buffer>(var));
                 }
                 ep_.mqtt_connected_ = true;
-                {
-                    ep_.publish_send_count_ = 0;
-                    ep_.resend_pubrel_.clear();
-                    {
-                        LockGuard<Mutex> lck (ep_.publish_received_mtx_);
-                        ep_.publish_received_.clear();
-                    }
-                    {
-                        LockGuard<Mutex> lck (ep_.publish_send_queue_mtx_);
-                        ep_.publish_send_queue_.clear();
-                    }
-                }
-                if (!ep_.set_values_from_props_on_connection(connection_type::server, props_)) return;
                 switch (ep_.version_) {
                 case protocol_version::v3_1_1:
                     if (ep_.on_connect(
@@ -7184,6 +6841,12 @@ private:
                     }
                     break;
                 case protocol_version::v5:
+                    if (auto ta_opt = get_topic_alias_maximum_from_props(props_)) {
+                        if (ta_opt.value() > 0) {
+                            LockGuard<Mutex> lck (ep_.topic_alias_send_mtx_);
+                            ep_.topic_alias_send_.emplace(ta_opt.value());
+                        }
+                    }
                     if (ep_.on_v5_connect(
                             force_move(client_id_),
                             force_move(user_name_),
@@ -7309,19 +6972,7 @@ private:
                 }
                 props_ = force_move(variant_get<v5::properties>(var));
                 ep_.mqtt_connected_ = true;
-                {
-                    ep_.publish_send_count_ = 0;
-                    ep_.resend_pubrel_.clear();
-                    {
-                        LockGuard<Mutex> lck (ep_.publish_received_mtx_);
-                        ep_.publish_received_.clear();
-                    }
-                    {
-                        LockGuard<Mutex> lck (ep_.publish_send_queue_mtx_);
-                        ep_.publish_send_queue_.clear();
-                    }
-                }
-                if (!ep_.set_values_from_props_on_connection(connection_type::server, props_)) return;
+
                 {
                     auto connack_proc =
                         [this]
@@ -7345,6 +6996,12 @@ private:
                                 }
                                 break;
                             case protocol_version::v5:
+                                if (auto ta_opt = get_topic_alias_maximum_from_props(props_)) {
+                                    if (ta_opt.value() > 0) {
+                                        LockGuard<Mutex> lck (ep_.topic_alias_send_mtx_);
+                                        ep_.topic_alias_send_.emplace(ta_opt.value());
+                                    }
+                                }
                                 if (ep_.on_v5_connack(
                                         session_present_,
                                         variant_get<v5::connect_reason_code>(reason_code_),
@@ -7549,97 +7206,28 @@ private:
                 {
                     auto handler_call =
                         [&] {
-                            auto check_full =
-                                [&] {
-                                    LockGuard<Mutex> lck (ep_.publish_received_mtx_);
-                                    if (ep_.publish_received_.size() == ep_.publish_recv_max_) {
-                                        return true;
-                                    }
-                                    ep_.publish_received_.insert(*packet_id_);
-                                    return false;
-                                };
                             switch (ep_.version_) {
                             case protocol_version::v3_1_1:
-                                return ep_.on_publish(
-                                    packet_id_,
-                                    publish_options(ep_.fixed_header_),
-                                    force_move(topic_name_),
-                                    force_move(variant_get<buffer>(var))
-                                );
-                            case protocol_version::v5:
-                                switch (qos_value_) {
-                                case qos::at_most_once:
-                                    break;
-                                    // automatically response error using puback / pubrec
-                                    // but the connection continues.
-                                    // publish handler is not called
-                                case qos::at_least_once:
-                                    if (check_full()) {
-                                        if (ep_.async_notify_) {
-                                            ep_.async_send_puback(
-                                                *packet_id_,
-                                                v5::puback_reason_code::quota_exceeded,
-                                                v5::properties{},
-                                                [](auto){}
-                                            );
-                                        }
-                                        else {
-                                            ep_.send_puback(
-                                                *packet_id_,
-                                                v5::puback_reason_code::quota_exceeded,
-                                                v5::properties{}
-                                            );
-                                        }
-                                        ep_.on_mqtt_message_processed(
-                                            force_move(
-                                                std::get<0>(
-                                                    any_cast<
+                                if (ep_.on_publish(
+                                        packet_id_,
+                                        publish_options(ep_.fixed_header_),
+                                        force_move(topic_name_),
+                                        force_move(force_move(variant_get<buffer>(var))))) {
+                                    ep_.on_mqtt_message_processed(
+                                        force_move(
+                                            std::get<0>(
+                                                any_cast<
                                                     std::tuple<any, process_type_sp>
-                                                    >(session_life_keeper)
-                                                )
+                                                >(session_life_keeper)
                                             )
-                                        );
-                                        return false;
-                                    }
-                                    break;
-                                case qos::exactly_once:
-                                    if (check_full()) {
-                                        if (ep_.async_notify_) {
-                                            ep_.async_send_pubrec(
-                                                *packet_id_,
-                                                v5::pubrec_reason_code::quota_exceeded,
-                                                v5::properties{},
-                                                [](auto){}
-                                            );
-                                        }
-                                        else {
-                                            ep_.send_pubrec(
-                                                *packet_id_,
-                                                v5::pubrec_reason_code::quota_exceeded,
-                                                v5::properties{}
-                                            );
-                                        }
-                                        ep_.on_mqtt_message_processed(
-                                            force_move(
-                                                std::get<0>(
-                                                    any_cast<
-                                                    std::tuple<any, process_type_sp>
-                                                    >(session_life_keeper)
-                                                )
-                                            )
-                                        );
-                                        return false;
-                                    }
-                                    break;
+                                        )
+                                    );
+                                    return true;
                                 }
+                                break;
+                            case protocol_version::v5:
                                 if (topic_name_.empty()) {
                                     if (auto topic_alias = get_topic_alias_from_props(props_)) {
-                                        if (topic_alias.value() == 0 ||
-                                            topic_alias.value() > ep_.topic_alias_recv_.value().max()) {
-                                            ep_.send_error_disconnect(v5::disconnect_reason_code::topic_alias_invalid);
-                                            ep_.call_protocol_error_handlers();
-                                            return false;
-                                        }
                                         auto topic_name = [&] {
                                             LockGuard<Mutex> lck (ep_.topic_alias_recv_mtx_);
                                             if (ep_.topic_alias_recv_) {
@@ -7652,7 +7240,6 @@ private:
                                                 << MQTT_ADD_VALUE(address, &ep_)
                                                 << "no matching topic alias: "
                                                 << topic_alias.value();
-                                            ep_.send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                                             ep_.call_protocol_error_handlers();
                                             return false;
                                         }
@@ -7669,16 +7256,26 @@ private:
                                         }
                                     }
                                 }
-                                {
-                                    auto ret =  ep_.on_v5_publish(
+                                if (ep_.on_v5_publish(
                                         packet_id_,
                                         publish_options(ep_.fixed_header_),
                                         force_move(topic_name_),
                                         force_move(variant_get<buffer>(var)),
                                         force_move(props_)
+                                    )
+                                ) {
+                                    ep_.on_mqtt_message_processed(
+                                        force_move(
+                                            std::get<0>(
+                                                any_cast<
+                                                    std::tuple<any, process_type_sp>
+                                                >(session_life_keeper)
+                                            )
+                                        )
                                     );
-                                    return ret;
+                                    return true;
                                 }
+                                break;
                             default:
                                 BOOST_ASSERT(false);
                             }
@@ -7686,29 +7283,10 @@ private:
                         };
                     switch (qos_value_) {
                     case qos::at_most_once:
-                        if (handler_call()) {
-                            ep_.on_mqtt_message_processed(
-                                force_move(
-                                    std::get<0>(
-                                        any_cast<
-                                        std::tuple<any, process_type_sp>
-                                        >(session_life_keeper)
-                                    )
-                                )
-                            );
-                        }
+                        handler_call();
                         break;
                     case qos::at_least_once:
                         if (handler_call()) {
-                            ep_.on_mqtt_message_processed(
-                                force_move(
-                                    std::get<0>(
-                                        any_cast<
-                                        std::tuple<any, process_type_sp>
-                                        >(session_life_keeper)
-                                    )
-                                )
-                            );
                             ep_.auto_pub_response(
                                 [this] {
                                     if (ep_.connected_) {
@@ -7733,67 +7311,29 @@ private:
                         }
                         break;
                     case qos::exactly_once:
-                        if (ep_.qos2_publish_handled_.find(*packet_id_) == ep_.qos2_publish_handled_.end()) {
-                            if (handler_call()) {
-                                ep_.on_mqtt_message_processed(
-                                    force_move(
-                                        std::get<0>(
-                                            any_cast<
-                                            std::tuple<any, process_type_sp>
-                                            >(session_life_keeper)
-                                        )
-                                    )
-                                );
-                                ep_.qos2_publish_handled_.emplace(*packet_id_);
-                                ep_.auto_pub_response(
-                                    [this] {
-                                        if (ep_.connected_) {
-                                            ep_.send_pubrec(
-                                                *packet_id_,
-                                                v5::pubrec_reason_code::success,
-                                                v5::properties{}
-                                            );
-                                        }
-                                    },
-                                    [this] {
-                                        if (ep_.connected_) {
-                                            ep_.async_send_pubrec(
-                                                *packet_id_,
-                                                v5::pubrec_reason_code::success,
-                                                v5::properties{},
-                                                [](auto){}
-                                            );
-                                        }
+                        if (handler_call()) {
+                            ep_.qos2_publish_handled_.emplace(*packet_id_);
+                            ep_.auto_pub_response(
+                                [this] {
+                                    if (ep_.connected_) {
+                                        ep_.send_pubrec(
+                                            *packet_id_,
+                                            v5::pubrec_reason_code::success,
+                                            v5::properties{}
+                                        );
                                     }
-                                );
-                            }
-                        }
-                        else {
-                            // publish has already been handled
-                            ep_.on_mqtt_message_processed(
-                                force_move(
-                                    std::get<0>(
-                                        any_cast<
-                                        std::tuple<any, process_type_sp>
-                                        >(session_life_keeper)
-                                    )
-                                )
+                                },
+                                [this] {
+                                    if (ep_.connected_) {
+                                        ep_.async_send_pubrec(
+                                            *packet_id_,
+                                            v5::pubrec_reason_code::success,
+                                            v5::properties{},
+                                            [](auto){}
+                                        );
+                                    }
+                                }
                             );
-                            if (ep_.async_notify_) {
-                                ep_.async_send_pubrec(
-                                    *packet_id_,
-                                    v5::pubrec_reason_code::success,
-                                    v5::properties{},
-                                    [](auto){}
-                                );
-                            }
-                            else {
-                                ep_.send_pubrec(
-                                    *packet_id_,
-                                    v5::pubrec_reason_code::success,
-                                    v5::properties{}
-                                );
-                            }
                         }
                         break;
                     }
@@ -7901,20 +7441,14 @@ private:
                         props_ = force_move(variant_get<v5::properties>(var));
                     }
                 }
-                auto erased =
-                    [&] {
-                        LockGuard<Mutex> lck (ep_.store_mtx_);
-                        auto& idx = ep_.store_.template get<tag_packet_id_type>();
-                        auto r = idx.equal_range(std::make_tuple(packet_id_, control_packet_type::puback));
-
-                        // puback packet_id is not matched to publish
-                        if (std::get<0>(r) == std::get<1>(r)) return false;
-
-                        idx.erase(std::get<0>(r), std::get<1>(r));
-                        ep_.pid_man_.release_id(packet_id_);
-                        return true;
-                    } ();
-                if (erased) ep_.on_serialize_remove(packet_id_);
+                {
+                    LockGuard<Mutex> lck (ep_.store_mtx_);
+                    auto& idx = ep_.store_.template get<tag_packet_id_type>();
+                    auto r = idx.equal_range(std::make_tuple(packet_id_, control_packet_type::puback));
+                    idx.erase(std::get<0>(r), std::get<1>(r));
+                    ep_.pid_man_.release_id(packet_id_);
+                }
+                ep_.on_serialize_remove(packet_id_);
                 switch (ep_.version_) {
                 case protocol_version::v3_1_1:
                     if (ep_.on_puback(packet_id_)) {
@@ -7930,7 +7464,6 @@ private:
                     }
                     break;
                 case protocol_version::v5:
-                    if (erased) ep_.send_publish_queue_one();
                     if (ep_.on_v5_puback(packet_id_, reason_code_, force_move(props_))) {
                         ep_.on_mqtt_message_processed(
                             force_move(
@@ -8049,35 +7582,23 @@ private:
                         props_ = force_move(variant_get<v5::properties>(var));
                     }
                 }
-                auto erased =
-                    [&] {
-                        LockGuard<Mutex> lck (ep_.store_mtx_);
-                        auto& idx = ep_.store_.template get<tag_packet_id_type>();
-                        auto r = idx.equal_range(std::make_tuple(packet_id_, control_packet_type::pubrec));
-
-                        // pubrec packet_id is not matched to publish
-                        if (std::get<0>(r) == std::get<1>(r)) return false;
-
-                        idx.erase(std::get<0>(r), std::get<1>(r));
-                        // packet_id should be erased here only if reason_code is error.
-                        // Otherwise the packet_id is continue to be used for pubrel/pubcomp.
-                        if (is_error(reason_code_)) ep_.pid_man_.release_id(packet_id_);
-                        return true;
-                    } ();
+                {
+                    LockGuard<Mutex> lck (ep_.store_mtx_);
+                    auto& idx = ep_.store_.template get<tag_packet_id_type>();
+                    auto r = idx.equal_range(std::make_tuple(packet_id_, control_packet_type::pubrec));
+                    idx.erase(std::get<0>(r), std::get<1>(r));
+                    // packet_id shouldn't be erased here.
+                    // It is reused for pubrel/pubcomp.
+                }
                 {
                     auto res =
                         [&] {
-                            auto rc =
-                                [&] {
-                                    if (erased) return v5::pubrel_reason_code::success;
-                                    return v5::pubrel_reason_code::packet_identifier_not_found;
-                                } ();
                             ep_.auto_pub_response(
                                 [&] {
                                     if (ep_.connected_) {
                                         ep_.send_pubrel(
                                             packet_id_,
-                                            rc,
+                                            v5::pubrel_reason_code::success,
                                             v5::properties{},
                                             any{}
                                         );
@@ -8085,7 +7606,7 @@ private:
                                     else {
                                         ep_.store_pubrel(
                                             packet_id_,
-                                            rc,
+                                            v5::pubrel_reason_code::success,
                                             v5::properties{},
                                             any{}
                                         );
@@ -8095,7 +7616,7 @@ private:
                                     if (ep_.connected_) {
                                         ep_.async_send_pubrel(
                                             packet_id_,
-                                            rc,
+                                            v5::pubrel_reason_code::success,
                                             v5::properties{},
                                             any{},
                                             [](auto){}
@@ -8104,7 +7625,7 @@ private:
                                     else {
                                         ep_.store_pubrel(
                                             packet_id_,
-                                            rc,
+                                            v5::pubrel_reason_code::success,
                                             v5::properties{},
                                             any{}
                                         );
@@ -8128,12 +7649,8 @@ private:
                         }
                         break;
                     case protocol_version::v5:
-                        if (erased && is_error(reason_code_)) {
-                            ep_.on_serialize_remove(packet_id_);
-                            ep_.send_publish_queue_one();
-                        }
                         if (ep_.on_v5_pubrec(packet_id_, reason_code_, force_move(props_))) {
-                            if (!is_error(reason_code_)) res();
+                            res();
                             ep_.on_mqtt_message_processed(
                                 force_move(
                                     std::get<0>(
@@ -8257,7 +7774,7 @@ private:
                                     if (ep_.connected_) {
                                         ep_.send_pubcomp(
                                             packet_id_,
-                                            static_cast<v5::pubcomp_reason_code>(reason_code_),
+                                            v5::pubcomp_reason_code::success,
                                             v5::properties{}
                                         );
                                     }
@@ -8266,7 +7783,7 @@ private:
                                     if (ep_.connected_) {
                                         ep_.async_send_pubcomp(
                                             packet_id_,
-                                            static_cast<v5::pubcomp_reason_code>(reason_code_),
+                                            v5::pubcomp_reason_code::success,
                                             v5::properties{},
                                             [](auto){}
                                         );
@@ -8409,20 +7926,14 @@ private:
                         props_ = force_move(variant_get<v5::properties>(var));
                     }
                 }
-                auto erased =
-                    [&] {
-                        LockGuard<Mutex> lck (ep_.store_mtx_);
-                        auto& idx = ep_.store_.template get<tag_packet_id_type>();
-                        auto r = idx.equal_range(std::make_tuple(packet_id_, control_packet_type::pubcomp));
-
-                        // pubcomp packet_id is not matched to pubrel
-                        if (std::get<0>(r) == std::get<1>(r)) return false;
-
-                        idx.erase(std::get<0>(r), std::get<1>(r));
-                        ep_.pid_man_.release_id(packet_id_);
-                        return true;
-                    } ();
-                if (erased) ep_.on_serialize_remove(packet_id_);
+                {
+                    LockGuard<Mutex> lck (ep_.store_mtx_);
+                    auto& idx = ep_.store_.template get<tag_packet_id_type>();
+                    auto r = idx.equal_range(std::make_tuple(packet_id_, control_packet_type::pubcomp));
+                    idx.erase(std::get<0>(r), std::get<1>(r));
+                    ep_.pid_man_.release_id(packet_id_);
+                }
+                ep_.on_serialize_remove(packet_id_);
                 switch (ep_.version_) {
                 case protocol_version::v3_1_1:
                     if (ep_.on_pubcomp(packet_id_)) {
@@ -8438,9 +7949,6 @@ private:
                     }
                     break;
                 case protocol_version::v5:
-                    if (erased && ep_.resend_pubrel_.find(packet_id_) == ep_.resend_pubrel_.end()) {
-                        ep_.send_publish_queue_one();
-                    }
                     if (ep_.on_v5_pubcomp(packet_id_, reason_code_, force_move(props_))) {
                         ep_.on_mqtt_message_processed(
                             force_move(
@@ -8554,7 +8062,6 @@ private:
                             << "topic_filter parse error"
                             << " whole_topic_filter: "
                             << variant_get<buffer>(var);
-                        ep_.send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                         ep_.call_protocol_error_handlers();
                         return;
                     }
@@ -8885,7 +8392,6 @@ private:
                             << "topic_filter parse error"
                             << " whole_topic_filter: "
                             << variant_get<buffer>(var);
-                        ep_.send_error_disconnect(v5::disconnect_reason_code::protocol_error);
                         ep_.call_protocol_error_handlers();
                         return;
                     }
@@ -9359,7 +8865,7 @@ private:
             );
             break;
         case protocol_version::v5:
-            update_values_and_props_on_start_connection(props);
+            update_topic_alias_maximum_recv(props);
             do_sync_write(
                 v5::connect_message(
                     keep_alive_sec,
@@ -9384,25 +8890,24 @@ private:
         v5::properties props
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::connack_message(
-                session_present,
-                variant_get<connect_return_code>(reason_code)
+        case protocol_version::v3_1_1:
+            do_sync_write(
+                v3_1_1::connack_message(
+                    session_present,
+                    variant_get<connect_return_code>(reason_code)
+                )
             );
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
-        case protocol_version::v5: {
-            update_values_and_props_on_start_connection(props);
-            auto msg = v5::connack_message(
-                session_present,
-                variant_get<v5::connect_reason_code>(reason_code),
-                force_move(props)
+            break;
+        case protocol_version::v5:
+            update_topic_alias_maximum_recv(props);
+            do_sync_write(
+                v5::connack_message(
+                    session_present,
+                    variant_get<v5::connect_reason_code>(reason_code),
+                    force_move(props)
+                )
             );
-            do_sync_write(force_move(msg));
-        } break;
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -9416,7 +8921,7 @@ private:
             v5::basic_publish_message<PacketIdBytes>
         >::value
     >
-    remove_topic_alias(
+    store_topic_alias(
         PublishMessage& msg,
         any& life_keeper
     ) {
@@ -9459,17 +8964,16 @@ private:
             v5::basic_publish_message<PacketIdBytes>
         >::value
     >
-    remove_topic_alias(PublishMessage&, any&) {}
+    store_topic_alias(PublishMessage&, any&) {}
 
     template <typename PublishMessage>
     std::enable_if_t<
         std::is_same<
             PublishMessage,
             v5::basic_publish_message<PacketIdBytes>
-        >::value,
-        std::tuple<PublishMessage, any>
+        >::value
     >
-    apply_topic_alias(PublishMessage msg, any life_keeper) {
+    apply_topic_alias(PublishMessage& msg, any& life_keeper, bool checked) {
         auto clear_topic_name_and_add_topic_alias =
             [&](topic_alias_t ta) {
                 auto topic_name_buf = buffer();
@@ -9479,6 +8983,9 @@ private:
             };
 
         if (msg.topic().empty()) {
+            if (checked) return;
+
+            // Recover topic alias for store
             if (auto ta_opt = get_topic_alias_from_props(msg.props())) {
                 LockGuard<Mutex> lck (topic_alias_send_mtx_);
                 std::string t;
@@ -9541,7 +9048,6 @@ private:
                 }
             }
         }
-        return std::make_tuple(force_move(msg), force_move(life_keeper));
     }
 
     template <typename PublishMessage>
@@ -9549,25 +9055,23 @@ private:
         !std::is_same<
             PublishMessage,
             v5::basic_publish_message<PacketIdBytes>
-        >::value,
-        std::tuple<PublishMessage, any>
+        >::value
     >
-    apply_topic_alias(PublishMessage msg, any life_keeper) {
-        return std::make_tuple(force_move(msg), force_move(life_keeper));
-    }
+    apply_topic_alias(PublishMessage&, any&, bool) {}
 
-    template <typename PublishMessage, typename SerializePublish, typename ReceiveMaximumProc>
-    bool preprocess_publish_message(
-        PublishMessage const& msg,
+    template <typename PublishMessage, typename SerializePublish>
+    void preprocess_publish_message(
+        PublishMessage& msg,
         any life_keeper,
         SerializePublish const& serialize_publish,
-        ReceiveMaximumProc const& receive_maximum_proc,
         bool register_pid = false
     ) {
         auto qos_value = msg.get_qos();
+        bool checked = false;
         if (qos_value == qos::at_least_once || qos_value == qos::exactly_once) {
             auto store_msg = msg;
-            remove_topic_alias(store_msg, life_keeper);
+            store_topic_alias(store_msg, life_keeper);
+            checked = true;
             store_msg.set_dup(true);
             auto packet_id = store_msg.packet_id();
 
@@ -9585,10 +9089,9 @@ private:
                 store_msg,
                 force_move(life_keeper)
             );
-            (this->*serialize_publish)(store_msg);
-            if (!receive_maximum_proc(force_move(store_msg))) return false;
+            (this->*serialize_publish)(force_move(store_msg));
         }
-        return true;
+        apply_topic_alias(msg, life_keeper, checked);
     }
 
     template <typename ConstBufferSequence>
@@ -9604,24 +9107,13 @@ private:
         any                 life_keeper) {
 
         auto do_send_publish =
-            [&](auto msg, auto const& serialize_publish, auto const& receive_maximum_proc) {
-                auto msg_lk = apply_topic_alias(msg, life_keeper);
-                if (maximum_packet_size_send_ < size<PacketIdBytes>(std::get<0>(msg_lk))) {
-                    if (packet_id != 0) {
-                        LockGuard<Mutex> lck_store (store_mtx_);
-                        pid_man_.release_id(packet_id);
-                    }
-                    throw packet_size_error();
-                }
-                if (preprocess_publish_message(
-                        msg,
-                        life_keeper,
-                        serialize_publish,
-                        receive_maximum_proc
-                    )
-                ) {
-                    do_sync_write(force_move(std::get<0>(msg_lk)));
-                }
+            [&](auto msg, auto const& serialize_publish) {
+                preprocess_publish_message(
+                    msg,
+                    life_keeper,
+                    serialize_publish
+                );
+                do_sync_write(force_move(msg));
             };
 
         switch (version_) {
@@ -9633,8 +9125,7 @@ private:
                     force_move(payloads),
                     pubopts
                 ),
-                &endpoint::on_serialize_publish_message,
-                [] (auto&&) { return true; }
+                &endpoint::on_serialize_publish_message
             );
             break;
         case protocol_version::v5:
@@ -9646,21 +9137,7 @@ private:
                     pubopts,
                     force_move(props)
                 ),
-                &endpoint::on_serialize_v5_publish_message,
-                [this] (v5::basic_publish_message<PacketIdBytes>&& msg) {
-                    if (publish_send_count_.load() == publish_send_max_) {
-                        LockGuard<Mutex> lck (publish_send_queue_mtx_);
-                        publish_send_queue_.emplace_back(force_move(msg));
-                        return false;
-                    }
-                    else {
-                        MQTT_LOG("mqtt_impl", trace)
-                            << MQTT_ADD_VALUE(address, this)
-                            << "increment publish_send_count_:" << publish_send_count_.load();
-                        ++publish_send_count_;
-                    }
-                    return true;
-                }
+                &endpoint::on_serialize_v5_publish_message
             );
             break;
         default:
@@ -9675,21 +9152,12 @@ private:
         v5::properties props
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_puback_message<PacketIdBytes>(packet_id);
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_puback_message<PacketIdBytes>(packet_id, reason, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-            erase_publish_received(packet_id);
-        } break;
+        case protocol_version::v3_1_1:
+            do_sync_write(v3_1_1::basic_puback_message<PacketIdBytes>(packet_id));
+            break;
+        case protocol_version::v5:
+            do_sync_write(v5::basic_puback_message<PacketIdBytes>(packet_id, reason, force_move(props)));
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -9704,21 +9172,12 @@ private:
         v5::properties props
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_pubrec_message<PacketIdBytes>(packet_id);
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_pubrec_message<PacketIdBytes>(packet_id, reason, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-            erase_publish_received(packet_id);
-        } break;
+        case protocol_version::v3_1_1:
+            do_sync_write(v3_1_1::basic_pubrec_message<PacketIdBytes>(packet_id));
+            break;
+        case protocol_version::v5:
+            do_sync_write(v5::basic_pubrec_message<PacketIdBytes>(packet_id, reason, force_move(props)));
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -9735,10 +9194,6 @@ private:
         auto impl =
             [&](auto msg, auto const& serialize) {
                 {
-                    if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                        throw packet_size_error();
-                    }
-
                     LockGuard<Mutex> lck (store_mtx_);
 
                     // insert if not registerd (start from pubrel sending case)
@@ -9851,20 +9306,12 @@ private:
         v5::properties props
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_pubcomp_message<PacketIdBytes>(packet_id);
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_pubcomp_message<PacketIdBytes>(packet_id, reason, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
+        case protocol_version::v3_1_1:
+            do_sync_write(v3_1_1::basic_pubcomp_message<PacketIdBytes>(packet_id));
+            break;
+        case protocol_version::v5:
+            do_sync_write(v5::basic_pubcomp_message<PacketIdBytes>(packet_id, reason, force_move(props)));
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -9878,6 +9325,10 @@ private:
         packet_id_t packet_id,
         v5::properties props
     ) {
+        {
+            LockGuard<Mutex> lck (sub_unsub_inflight_mtx_);
+            sub_unsub_inflight_.insert(packet_id);
+        }
         for(auto const& p : params)
         {
             (void)p;
@@ -9888,36 +9339,12 @@ private:
             );
         }
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_subscribe_message<PacketIdBytes>(force_move(params), packet_id);
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                {
-                    LockGuard<Mutex> lck_store (store_mtx_);
-                    pid_man_.release_id(packet_id);
-                }
-                throw packet_size_error();
-            }
-            {
-                LockGuard<Mutex> lck (sub_unsub_inflight_mtx_);
-                sub_unsub_inflight_.insert(packet_id);
-            }
-            do_sync_write(force_move(msg));
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_subscribe_message<PacketIdBytes>(force_move(params), packet_id, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                {
-                    LockGuard<Mutex> lck_store (store_mtx_);
-                    pid_man_.release_id(packet_id);
-                }
-                throw packet_size_error();
-            }
-            {
-                LockGuard<Mutex> lck (sub_unsub_inflight_mtx_);
-                sub_unsub_inflight_.insert(packet_id);
-            }
-            do_sync_write(force_move(msg));
-        } break;
+        case protocol_version::v3_1_1:
+            do_sync_write(v3_1_1::basic_subscribe_message<PacketIdBytes>(force_move(params), packet_id));
+            break;
+        case protocol_version::v5:
+            do_sync_write(v5::basic_subscribe_message<PacketIdBytes>(force_move(params), packet_id, force_move(props)));
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -9930,27 +9357,12 @@ private:
         v5::properties props
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_suback_message<PacketIdBytes>(
-                force_move(variant_get<std::vector<suback_return_code>>(params)),
-                packet_id
-            );
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_suback_message<PacketIdBytes>(
-                force_move(variant_get<std::vector<v5::suback_reason_code>>(params)),
-                packet_id,
-                force_move(props)
-            );
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
+        case protocol_version::v3_1_1:
+            do_sync_write(v3_1_1::basic_suback_message<PacketIdBytes>(force_move(variant_get<std::vector<suback_return_code>>(params)), packet_id));
+            break;
+        case protocol_version::v5:
+            do_sync_write(v5::basic_suback_message<PacketIdBytes>(force_move(variant_get<std::vector<v5::suback_reason_code>>(params)), packet_id, force_move(props)));
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -9962,37 +9374,17 @@ private:
         packet_id_t packet_id,
         v5::properties props
     ) {
+        {
+            LockGuard<Mutex> lck (sub_unsub_inflight_mtx_);
+            sub_unsub_inflight_.insert(packet_id);
+        }
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_unsubscribe_message<PacketIdBytes>(force_move(params), packet_id);
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                {
-                    LockGuard<Mutex> lck_store (store_mtx_);
-                    pid_man_.release_id(packet_id);
-                }
-                throw packet_size_error();
-            }
-            {
-                LockGuard<Mutex> lck (sub_unsub_inflight_mtx_);
-                sub_unsub_inflight_.insert(packet_id);
-            }
-            do_sync_write(force_move(msg));
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_unsubscribe_message<PacketIdBytes>(force_move(params), packet_id, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                {
-                    LockGuard<Mutex> lck_store (store_mtx_);
-                    pid_man_.release_id(packet_id);
-                }
-                throw packet_size_error();
-            }
-            {
-                LockGuard<Mutex> lck (sub_unsub_inflight_mtx_);
-                sub_unsub_inflight_.insert(packet_id);
-            }
-            do_sync_write(force_move(msg));
-        } break;
+        case protocol_version::v3_1_1:
+            do_sync_write(v3_1_1::basic_unsubscribe_message<PacketIdBytes>(force_move(params), packet_id));
+            break;
+        case protocol_version::v5:
+            do_sync_write(v5::basic_unsubscribe_message<PacketIdBytes>(force_move(params), packet_id, force_move(props)));
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10003,13 +9395,9 @@ private:
         packet_id_t packet_id
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_unsuback_message<PacketIdBytes>(packet_id);
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
+        case protocol_version::v3_1_1:
+            do_sync_write(v3_1_1::basic_unsuback_message<PacketIdBytes>(packet_id));
+            break;
         case protocol_version::v5:
             BOOST_ASSERT(false);
             break;
@@ -10028,13 +9416,9 @@ private:
         case protocol_version::v3_1_1:
             BOOST_ASSERT(false);
             break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_unsuback_message<PacketIdBytes>(force_move(params), packet_id, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
+        case protocol_version::v5:
+            do_sync_write(v5::basic_unsuback_message<PacketIdBytes>(force_move(params), packet_id, force_move(props)));
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10043,22 +9427,14 @@ private:
 
     void send_pingreq() {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::pingreq_message();
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
+        case protocol_version::v3_1_1:
+            do_sync_write(v3_1_1::pingreq_message());
             set_pingresp_timer();
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::pingreq_message();
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
+            break;
+        case protocol_version::v5:
+            do_sync_write(v5::pingreq_message());
             set_pingresp_timer();
-        } break;
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10067,20 +9443,12 @@ private:
 
     void send_pingresp() {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::pingresp_message();
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::pingresp_message();
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
+        case protocol_version::v3_1_1:
+            do_sync_write(v3_1_1::pingresp_message());
+            break;
+        case protocol_version::v5:
+            do_sync_write(v5::pingresp_message());
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10095,13 +9463,9 @@ private:
         case protocol_version::v3_1_1:
             BOOST_ASSERT(false);
             break;
-        case protocol_version::v5: {
-            auto msg = v5::auth_message(reason, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
+        case protocol_version::v5:
+            do_sync_write(v5::auth_message(reason, force_move(props)));
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10113,20 +9477,12 @@ private:
         v5::properties props
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::disconnect_message();
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::disconnect_message(reason, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                throw packet_size_error();
-            }
-            do_sync_write(force_move(msg));
-        } break;
+        case protocol_version::v3_1_1:
+            do_sync_write(v3_1_1::disconnect_message());
+            break;
+        case protocol_version::v5:
+            do_sync_write(v5::disconnect_message(reason, force_move(props)));
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10134,76 +9490,10 @@ private:
     }
 
     void send_store() {
-        // packet_id has already been registered
         LockGuard<Mutex> lck (store_mtx_);
-        auto& idx = store_.template get<tag_seq>();
-        for (auto it = idx.begin(), end = idx.end(); it != end;) {
-            auto msg = it->message();
-            MQTT_NS::visit(
-                make_lambda_visitor(
-                    [&](v3_1_1::basic_publish_message<PacketIdBytes>& m) {
-                        MQTT_LOG("mqtt_api", info)
-                            << MQTT_ADD_VALUE(address, this)
-                            << "async_send_store publish v3.1.1";
-                        if (maximum_packet_size_send_ < size<PacketIdBytes>(m)) {
-                            pid_man_.release_id(m.packet_id());
-                            MQTT_LOG("mqtt_impl", warning)
-                                << MQTT_ADD_VALUE(address, this)
-                                << "over maximum packet size message removed. packet_id:" << m.packet_id();
-                            it = idx.erase(it);
-                            return;
-                        }
-                        do_sync_write(m);
-                        ++it;
-                    },
-                    [&](v3_1_1::basic_pubrel_message<PacketIdBytes>& m) {
-                        MQTT_LOG("mqtt_api", info)
-                            << MQTT_ADD_VALUE(address, this)
-                            << "async_send_store pubrel v3.1.1";
-                        do_sync_write(m);
-                        ++it;
-                    },
-                    [&](v5::basic_publish_message<PacketIdBytes>& m) {
-                        MQTT_LOG("mqtt_api", info)
-                            << MQTT_ADD_VALUE(address, this)
-                            << "async_send_store publish v5";
-                        any life_keeper;
-                        auto msg_lk = apply_topic_alias(m, force_move(life_keeper));
-                        if (maximum_packet_size_send_ < size<PacketIdBytes>(std::get<0>(msg_lk))) {
-                            pid_man_.release_id(m.packet_id());
-                            MQTT_LOG("mqtt_impl", warning)
-                                << MQTT_ADD_VALUE(address, this)
-                                << "over maximum packet size message removed. packet_id:" << m.packet_id();
-                            it = idx.erase(it);
-                            return;
-                        }
-                        if (publish_send_count_.load() == publish_send_max_) {
-                            LockGuard<Mutex> lck (publish_send_queue_mtx_);
-                            publish_send_queue_.emplace_back(
-                                force_move(std::get<0>(msg_lk)),
-                                force_move(std::get<1>(msg_lk))
-                            );
-                        }
-                        else {
-                            MQTT_LOG("mqtt_impl", trace)
-                                << MQTT_ADD_VALUE(address, this)
-                                << "increment publish_send_count_:" << publish_send_count_.load();
-                            ++publish_send_count_;
-                            do_sync_write(force_move(std::get<0>(msg_lk)));
-                        }
-                        ++it;
-                    },
-                    [&](v5::basic_pubrel_message<PacketIdBytes>& m) {
-                        MQTT_LOG("mqtt_api", info)
-                            << MQTT_ADD_VALUE(address, this)
-                            << "async_send_store pubrel v5";
-                        resend_pubrel_.insert(m.packet_id());
-                        do_sync_write(m);
-                        ++it;
-                    }
-                ),
-                msg
-            );
+        auto const& idx = store_.template get<tag_seq>();
+        for (auto const& e : idx) {
+            do_sync_write(get_basic_message_variant<PacketIdBytes>(e.message()));
         }
     }
 
@@ -10244,7 +9534,7 @@ private:
             );
             break;
         case protocol_version::v5:
-            update_values_and_props_on_start_connection(props);
+            update_topic_alias_maximum_recv(props);
             do_async_write(
                 v5::connect_message(
                     keep_alive_sec,
@@ -10271,44 +9561,26 @@ private:
         async_handler_t func
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::connack_message(
-                session_present,
-                variant_get<connect_return_code>(reason_code)
-            );
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
+        case protocol_version::v3_1_1:
             do_async_write(
-                force_move(msg),
+                v3_1_1::connack_message(
+                    session_present,
+                    variant_get<connect_return_code>(reason_code)
+                ),
                 force_move(func)
             );
-        } break;
-        case protocol_version::v5: {
-            update_values_and_props_on_start_connection(props);
-            auto msg = v5::connack_message(
-                session_present,
-                variant_get<v5::connect_reason_code>(reason_code),
-                force_move(props)
-            );
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
+            break;
+        case protocol_version::v5:
+            update_topic_alias_maximum_recv(props);
             do_async_write(
-                force_move(msg),
+                v5::connack_message(
+                    session_present,
+                    variant_get<v5::connect_reason_code>(reason_code),
+                    force_move(props)
+                ),
                 force_move(func)
             );
-        } break;
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10329,34 +9601,18 @@ private:
         async_handler_t func
     ) {
         auto do_async_send_publish =
-            [&](auto msg, auto const& serialize_publish, auto const& receive_maximum_proc) {
-                auto msg_lk = apply_topic_alias(msg, life_keeper);
-                if (maximum_packet_size_send_ < size<PacketIdBytes>(std::get<0>(msg_lk))) {
-                    if (packet_id != 0) {
-                        LockGuard<Mutex> lck_store (store_mtx_);
-                        pid_man_.release_id(packet_id);
+            [&](auto msg, auto const& serialize_publish) {
+                preprocess_publish_message(
+                    msg,
+                    life_keeper,
+                    serialize_publish
+                );
+                do_async_write(
+                    force_move(msg),
+                    [life_keeper = force_move(life_keeper), func = force_move(func)](error_code ec) {
+                        if (func) func(ec);
                     }
-                    socket_->post(
-                        [func = force_move(func)] {
-                            if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                        }
-                    );
-                    return;
-                }
-                if (preprocess_publish_message(
-                        msg,
-                        life_keeper,
-                        serialize_publish,
-                        receive_maximum_proc
-                    )
-                ) {
-                    do_async_write(
-                        force_move(std::get<0>(msg_lk)),
-                        [life_keeper = force_move(std::get<1>(msg_lk)), func](error_code ec) {
-                            if (func) func(ec);
-                        }
-                    );
-                }
+                );
             };
 
         switch (version_) {
@@ -10368,8 +9624,7 @@ private:
                     force_move(payloads),
                     pubopts
                 ),
-                &endpoint::on_serialize_publish_message,
-                [] (auto&&) { return true; }
+                &endpoint::on_serialize_publish_message
             );
             break;
         case protocol_version::v5:
@@ -10381,25 +9636,7 @@ private:
                     pubopts,
                     force_move(props)
                 ),
-                &endpoint::on_serialize_v5_publish_message,
-                [this, func] (v5::basic_publish_message<PacketIdBytes>&& msg) {
-                    if (publish_send_count_.load() == publish_send_max_) {
-                        if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                            if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                            return false;
-                        }
-                        LockGuard<Mutex> lck (publish_send_queue_mtx_);
-                        publish_send_queue_.emplace_back(force_move(msg), func);
-                        return false;
-                    }
-                    else {
-                        MQTT_LOG("mqtt_impl", trace)
-                            << MQTT_ADD_VALUE(address, this)
-                            << "increment publish_send_count_:" << publish_send_count_.load();
-                        ++publish_send_count_;
-                    }
-                    return true;
-                }
+                &endpoint::on_serialize_v5_publish_message
             );
             break;
         default:
@@ -10415,45 +9652,26 @@ private:
         async_handler_t func
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_puback_message<PacketIdBytes>(packet_id);
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
+        case protocol_version::v3_1_1:
             do_async_write(
-                force_move(msg),
+                v3_1_1::basic_puback_message<PacketIdBytes>(packet_id),
                 [this, self = this->shared_from_this(), packet_id, func = force_move(func)]
                 (error_code ec) {
                     if (func) func(ec);
                     on_pub_res_sent(packet_id);
                 }
             );
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_puback_message<PacketIdBytes>(packet_id, reason, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
+            break;
+        case protocol_version::v5:
             do_async_write(
-                force_move(msg),
+                v5::basic_puback_message<PacketIdBytes>(packet_id, reason, force_move(props)),
                 [this, self = this->shared_from_this(), packet_id, func = force_move(func)]
                 (error_code ec) {
-                    erase_publish_received(packet_id);
                     if (func) func(ec);
                     on_pub_res_sent(packet_id);
                 }
             );
-        } break;
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10467,40 +9685,18 @@ private:
         async_handler_t func
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_pubrec_message<PacketIdBytes>(packet_id);
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
+        case protocol_version::v3_1_1:
             do_async_write(
-                force_move(msg),
+                v3_1_1::basic_pubrec_message<PacketIdBytes>(packet_id),
                 force_move(func)
             );
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_pubrec_message<PacketIdBytes>(packet_id, reason, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
+            break;
+        case protocol_version::v5:
             do_async_write(
-                force_move(msg),
-                [this, self = this->shared_from_this(), packet_id, func = force_move(func)]
-                (error_code ec) {
-                    erase_publish_received(packet_id);
-                    if (func) func(ec);
-                }
+                v5::basic_pubrec_message<PacketIdBytes>(packet_id, reason, force_move(props)),
+                force_move(func)
             );
-        } break;
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10520,15 +9716,6 @@ private:
         auto impl =
             [&](auto msg, auto const& serialize) {
                 {
-                    if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                        socket_->post(
-                            [func = force_move(func)] {
-                                if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                            }
-                        );
-                        return;
-                    }
-
                     LockGuard<Mutex> lck (store_mtx_);
 
                     // insert if not registerd (start from pubrel sending case)
@@ -10601,44 +9788,26 @@ private:
         async_handler_t func
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_pubcomp_message<PacketIdBytes>(packet_id);
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
+        case protocol_version::v3_1_1:
             do_async_write(
-                force_move(msg),
+                v3_1_1::basic_pubcomp_message<PacketIdBytes>(packet_id),
                 [this, self = this->shared_from_this(), packet_id, func = force_move(func)]
                 (error_code ec) {
                     if (func) func(ec);
                     on_pub_res_sent(packet_id);
                 }
             );
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_pubcomp_message<PacketIdBytes>(packet_id, reason, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
+            break;
+        case protocol_version::v5:
             do_async_write(
-                force_move(msg),
+                v5::basic_pubcomp_message<PacketIdBytes>(packet_id, reason, force_move(props)),
                 [this, self = this->shared_from_this(), packet_id, func = force_move(func)]
                 (error_code ec) {
                     if (func) func(ec);
                     on_pub_res_sent(packet_id);
                 }
             );
-        } break;
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10651,53 +9820,28 @@ private:
         v5::properties props,
         async_handler_t func
     ) {
+        {
+            LockGuard<Mutex> lck (sub_unsub_inflight_mtx_);
+            sub_unsub_inflight_.insert(packet_id);
+        }
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_subscribe_message<PacketIdBytes>(force_move(params), packet_id);
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                {
-                    LockGuard<Mutex> lck_store (store_mtx_);
-                    pid_man_.release_id(packet_id);
-                }
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
-            {
-                LockGuard<Mutex> lck (sub_unsub_inflight_mtx_);
-                sub_unsub_inflight_.insert(packet_id);
-            }
+        case protocol_version::v3_1_1:
             do_async_write(
-                force_move(msg),
+                v3_1_1::basic_subscribe_message<PacketIdBytes>(
+                    force_move(params),
+                    packet_id),
                 force_move(func)
             );
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_subscribe_message<PacketIdBytes>(force_move(params), packet_id, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                {
-                    LockGuard<Mutex> lck_store (store_mtx_);
-                    pid_man_.release_id(packet_id);
-                }
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
-            {
-                LockGuard<Mutex> lck (sub_unsub_inflight_mtx_);
-                sub_unsub_inflight_.insert(packet_id);
-            }
+            break;
+        case protocol_version::v5:
             do_async_write(
-                force_move(msg),
+                v5::basic_subscribe_message<PacketIdBytes>(
+                    force_move(params),
+                    packet_id,
+                    force_move(props)),
                 force_move(func)
             );
-        } break;
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10711,43 +9855,23 @@ private:
         async_handler_t func
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_suback_message<PacketIdBytes>(
-                force_move(variant_get<std::vector<suback_return_code>>(params)),
-                packet_id
-            );
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
+        case protocol_version::v3_1_1:
             do_async_write(
-                force_move(msg),
+                v3_1_1::basic_suback_message<PacketIdBytes>(
+                    force_move(variant_get<std::vector<suback_return_code>>(params)),
+                    packet_id),
                 force_move(func)
             );
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_suback_message<PacketIdBytes>(
-                force_move(variant_get<std::vector<v5::suback_reason_code>>(params)),
-                packet_id,
-                force_move(props)
-            );
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
+            break;
+        case protocol_version::v5:
             do_async_write(
-                force_move(msg),
+                v5::basic_suback_message<PacketIdBytes>(
+                    force_move(variant_get<std::vector<v5::suback_reason_code>>(params)),
+                    packet_id,
+                    force_move(props)),
                 force_move(func)
             );
-        } break;
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10760,53 +9884,30 @@ private:
         v5::properties props,
         async_handler_t func
     ) {
+        {
+            LockGuard<Mutex> lck (sub_unsub_inflight_mtx_);
+            sub_unsub_inflight_.insert(packet_id);
+        }
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_unsubscribe_message<PacketIdBytes>(force_move(params), packet_id);
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                {
-                    LockGuard<Mutex> lck_store (store_mtx_);
-                    pid_man_.release_id(packet_id);
-                }
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
-            {
-                LockGuard<Mutex> lck (sub_unsub_inflight_mtx_);
-                sub_unsub_inflight_.insert(packet_id);
-            }
+        case protocol_version::v3_1_1:
             do_async_write(
-                force_move(msg),
+                v3_1_1::basic_unsubscribe_message<PacketIdBytes>(
+                    force_move(params),
+                    packet_id
+                ),
                 force_move(func)
             );
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_unsubscribe_message<PacketIdBytes>(force_move(params), packet_id, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                {
-                    LockGuard<Mutex> lck_store (store_mtx_);
-                    pid_man_.release_id(packet_id);
-                }
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
-            {
-                LockGuard<Mutex> lck (sub_unsub_inflight_mtx_);
-                sub_unsub_inflight_.insert(packet_id);
-            }
+            break;
+        case protocol_version::v5:
             do_async_write(
-                force_move(msg),
+                v5::basic_unsubscribe_message<PacketIdBytes>(
+                    force_move(params),
+                    packet_id,
+                    force_move(props)
+                ),
                 force_move(func)
             );
-        } break;
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10818,21 +9919,11 @@ private:
         async_handler_t func
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::basic_unsuback_message<PacketIdBytes>(packet_id);
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
+        case protocol_version::v3_1_1:
             do_async_write(
-                force_move(msg),
-                force_move(func)
+                v3_1_1::basic_unsuback_message<PacketIdBytes>(packet_id), force_move(func)
             );
-        } break;
+            break;
         case protocol_version::v5:
             BOOST_ASSERT(false);
             break;
@@ -10852,21 +9943,16 @@ private:
         case protocol_version::v3_1_1:
             BOOST_ASSERT(false);
             break;
-        case protocol_version::v5: {
-            auto msg = v5::basic_unsuback_message<PacketIdBytes>(force_move(params), packet_id, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
+        case protocol_version::v5:
             do_async_write(
-                force_move(msg),
+                v5::basic_unsuback_message<PacketIdBytes>(
+                    force_move(params),
+                    packet_id,
+                    force_move(props)
+                ),
                 force_move(func)
             );
-        } break;
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10875,32 +9961,14 @@ private:
 
     void async_send_pingreq(async_handler_t func) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::pingreq_message();
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
-            do_async_write(force_move(msg), force_move(func));
+        case protocol_version::v3_1_1:
+            do_async_write(v3_1_1::pingreq_message(), force_move(func));
             set_pingresp_timer();
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::pingreq_message();
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
-            do_async_write(force_move(msg), force_move(func));
+            break;
+        case protocol_version::v5:
+            do_async_write(v5::pingreq_message(), force_move(func));
             set_pingresp_timer();
-        } break;
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10909,30 +9977,12 @@ private:
 
     void async_send_pingresp(async_handler_t func) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::pingresp_message();
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
-            do_async_write(force_move(msg), force_move(func));
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::pingresp_message();
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
-            do_async_write(force_move(msg), force_move(func));
-        } break;
+        case protocol_version::v3_1_1:
+            do_async_write(v3_1_1::pingresp_message(), force_move(func));
+            break;
+        case protocol_version::v5:
+            do_async_write(v5::pingresp_message(), force_move(func));
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10948,18 +9998,9 @@ private:
         case protocol_version::v3_1_1:
             BOOST_ASSERT(false);
             break;
-        case protocol_version::v5: {
-            auto msg = v5::auth_message(reason, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
-            do_async_write(force_move(msg), force_move(func));
-        } break;
+        case protocol_version::v5:
+            do_async_write(v5::auth_message(reason, force_move(props)), force_move(func));
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -10972,30 +10013,12 @@ private:
         async_handler_t func
     ) {
         switch (version_) {
-        case protocol_version::v3_1_1: {
-            auto msg = v3_1_1::disconnect_message();
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
-            do_async_write(force_move(msg), force_move(func));
-        } break;
-        case protocol_version::v5: {
-            auto msg = v5::disconnect_message(reason, force_move(props));
-            if (maximum_packet_size_send_ < size<PacketIdBytes>(msg)) {
-                socket_->post(
-                    [func = force_move(func)] {
-                        if (func) func(boost::system::errc::make_error_code(boost::system::errc::message_size));
-                    }
-                );
-                return;
-            }
-            do_async_write(force_move(msg), force_move(func));
-        } break;
+        case protocol_version::v3_1_1:
+            do_async_write(v3_1_1::disconnect_message(), force_move(func));
+            break;
+        case protocol_version::v5:
+            do_async_write(v5::disconnect_message(reason, force_move(props)), force_move(func));
+            break;
         default:
             BOOST_ASSERT(false);
             break;
@@ -11003,103 +10026,19 @@ private:
     }
 
     void async_send_store(std::function<void()> func) {
-        // packet_id has already been registered
         auto g = shared_scope_guard(
             [func = force_move(func)] {
                 func();
             }
         );
         LockGuard<Mutex> lck (store_mtx_);
-        auto& idx = store_.template get<tag_seq>();
-        for (auto it = idx.begin(), end = idx.end(); it != end;) {
-            auto msg = it->message();
-            MQTT_NS::visit(
-                make_lambda_visitor(
-                    [&](v3_1_1::basic_publish_message<PacketIdBytes>& m) {
-                        MQTT_LOG("mqtt_api", info)
-                            << MQTT_ADD_VALUE(address, this)
-                            << "async_send_store publish v3.1.1";
-                        if (maximum_packet_size_send_ < size<PacketIdBytes>(m)) {
-                            pid_man_.release_id(m.packet_id());
-                            MQTT_LOG("mqtt_impl", warning)
-                                << MQTT_ADD_VALUE(address, this)
-                                << "over maximum packet size message removed. packet_id:" << m.packet_id();
-                            it = idx.erase(it);
-                            return;
-                        }
-                        do_async_write(
-                            m,
-                            [g]
-                            (error_code /*ec*/) {
-                            }
-                        );
-                        ++it;
-                    },
-                    [&](v3_1_1::basic_pubrel_message<PacketIdBytes>& m) {
-                        MQTT_LOG("mqtt_api", info)
-                            << MQTT_ADD_VALUE(address, this)
-                            << "async_send_store pubrel v3.1.1";
-                        do_async_write(
-                            m,
-                            [g]
-                            (error_code /*ec*/) {
-                            }
-                        );
-                        ++it;
-                    },
-                    [&](v5::basic_publish_message<PacketIdBytes>& m) {
-                        MQTT_LOG("mqtt_api", info)
-                            << MQTT_ADD_VALUE(address, this)
-                            << "async_send_store publish v5";
-                        any life_keeper;
-                        auto msg_lk = apply_topic_alias(m, force_move(life_keeper));
-                        if (maximum_packet_size_send_ < size<PacketIdBytes>(std::get<0>(msg_lk))) {
-                            pid_man_.release_id(m.packet_id());
-                            MQTT_LOG("mqtt_impl", warning)
-                                << MQTT_ADD_VALUE(address, this)
-                                << "over maximum packet size message removed. packet_id:" << m.packet_id();
-                            it = idx.erase(it);
-                            return;
-                        }
-                        if (publish_send_count_.load() == publish_send_max_) {
-                            LockGuard<Mutex> lck (publish_send_queue_mtx_);
-                            publish_send_queue_.emplace_back(
-                                force_move(std::get<0>(msg_lk)),
-                                [g]
-                                (error_code /*ec*/){
-                                },
-                                force_move(std::get<1>(msg_lk))
-                            );
-                        }
-                        else {
-                            MQTT_LOG("mqtt_impl", trace)
-                                << MQTT_ADD_VALUE(address, this)
-                                << "increment publish_send_count_:" << publish_send_count_.load();
-                            ++publish_send_count_;
-                            do_async_write(
-                                get_basic_message_variant<PacketIdBytes>(force_move(std::get<0>(msg_lk))),
-                                [g, life_keeper = force_move(std::get<1>(msg_lk))]
-                                (error_code /*ec*/) {
-                                }
-                            );
-                        }
-                        ++it;
-                    },
-                    [&](v5::basic_pubrel_message<PacketIdBytes>& m) {
-                        MQTT_LOG("mqtt_api", info)
-                            << MQTT_ADD_VALUE(address, this)
-                            << "async_send_store pubrel v5";
-                        resend_pubrel_.insert(m.packet_id());
-                        do_async_write(
-                            m,
-                            [g]
-                            (error_code /*ec*/) {
-                            }
-                        );
-                        ++it;
-                    }
-                ),
-                msg
+        auto const& idx = store_.template get<tag_seq>();
+        for (auto const& e : idx) {
+            do_async_write(
+                get_basic_message_variant<PacketIdBytes>(e.message()),
+                [g]
+                (error_code /*ec*/) {
+                }
             );
         }
     }
@@ -11153,7 +10092,7 @@ private:
                 self_->connected_ = false;
                 while (!self_->queue_.empty()) {
                     // Handlers for outgoing packets need not be valid.
-                    if (auto&& h = self_->queue_.front().handler()) h(ec);
+                    if(auto&& h = self_->queue_.front().handler()) h(ec);
                     self_->queue_.pop_front();
                 }
                 return;
@@ -11202,7 +10141,7 @@ private:
     void do_async_write() {
         // Only attempt to send up to the user specified maximum items
         using difference_t = typename decltype(queue_)::difference_type;
-        std::size_t iterator_count = (max_queue_send_count_ == 0)
+        std::size_t iterator_count =   (max_queue_send_count_ == 0)
                                 ? queue_.size()
                                 : std::min(max_queue_send_count_, queue_.size());
         auto const& start = queue_.cbegin();
@@ -11287,11 +10226,8 @@ private:
     void clean_sub_unsub_inflight() {
         LockGuard<Mutex> lck_store (store_mtx_);
         LockGuard<Mutex> lck_sub_unsub (sub_unsub_inflight_mtx_);
-        auto it = sub_unsub_inflight_.begin();
-        auto end = sub_unsub_inflight_.end();
-        while (it != end) {
-            pid_man_.release_id(*it);
-            it = sub_unsub_inflight_.erase(it);
+        for (auto packet_id : sub_unsub_inflight_) {
+            pid_man_.release_id(packet_id);
         }
     }
 
@@ -11322,68 +10258,68 @@ private:
         );
     }
 
-    void send_publish_queue_one() {
-        MQTT_LOG("mqtt_impl", trace)
-            << MQTT_ADD_VALUE(address, this)
-            << "derement publish_send_count_:" << publish_send_count_.load();
-        BOOST_ASSERT(publish_send_count_.load() > 0);
-        --publish_send_count_;
-        auto entry =
-            [&] () -> optional<publish_send_queue_elem> {
-                LockGuard<Mutex> lck (publish_send_queue_mtx_);
-                if (publish_send_queue_.empty()) return nullopt;
-                auto entry = force_move(publish_send_queue_.front());
-                publish_send_queue_.pop_front();
-                return entry;
-        } ();
-        if (!entry) return;
-        MQTT_LOG("mqtt_impl", trace)
-            << MQTT_ADD_VALUE(address, this)
-            << "increment publish_send_count_:" << publish_send_count_.load();
-        ++publish_send_count_;
-        if (entry.value().async) {
-            do_async_write(
-                force_move(entry.value().message),
-                [handler = force_move(entry.value().handler), life_keeper = force_move(entry.value().life_keeper)]
-                (error_code ec) {
-                    handler(ec);
-                }
-            );
+    void update_topic_alias_maximum_recv(v5::properties& props) {
+        if (auto ta_max = get_topic_alias_maximum_from_props(props)) {
+            if (ta_max.value() == 0) {
+                topic_alias_recv_ = nullopt;
+            }
+            else {
+                topic_alias_recv_.emplace(ta_max.value());
+            }
         }
         else {
-            do_sync_write(force_move(entry.value().message));
+            if (topic_alias_recv_&& topic_alias_recv_.value().max() != 0) {
+                props.emplace_back(
+                    MQTT_NS::v5::property::topic_alias_maximum(topic_alias_recv_.value().max())
+                );
+            }
         }
     }
 
-    void erase_publish_received(packet_id_t packet_id) {
-        LockGuard<Mutex> lck (publish_received_mtx_);
-        publish_received_.erase(packet_id);
+    static optional<topic_alias_t> get_topic_alias_maximum_from_prop(v5::property_variant const& prop) {
+        optional<topic_alias_t> val;
+        MQTT_NS::visit(
+            make_lambda_visitor(
+                [&val](v5::property::topic_alias_maximum const& p) {
+                    val = p.val();
+                },
+                [](auto&&) {
+                }
+            ), prop
+        );
+        return val;
+    }
+
+    static optional<topic_alias_t> get_topic_alias_maximum_from_props(v5::properties const& props) {
+        for (auto const& prop : props) {
+            if (auto val = get_topic_alias_maximum_from_prop(prop)) {
+                return val;
+            }
+        }
+        return nullopt;
     }
 
     static optional<topic_alias_t> get_topic_alias_from_prop(v5::property_variant const& prop) {
         optional<topic_alias_t> val;
-        v5::visit_prop(
-            prop,
-            [&val](v5::property::topic_alias const& p) {
-                val = p.val();
-            },
-            [](auto&&) {
-            }
+        MQTT_NS::visit(
+            make_lambda_visitor(
+                [&val](v5::property::topic_alias const& p) {
+                    val = p.val();
+                },
+                [](auto&&) {
+                }
+            ), prop
         );
         return val;
     }
 
     static optional<topic_alias_t> get_topic_alias_from_props(v5::properties const& props) {
-        optional<topic_alias_t> val;
-        v5::visit_props(
-            props,
-            [&val](v5::property::topic_alias const& p) {
-                val = p.val();
-            },
-            [](auto&&) {
+        for (auto const& prop : props) {
+            if (auto val = get_topic_alias_from_prop(prop)) {
+                return val;
             }
-        );
-        return val;
+        }
+        return nullopt;
     }
 
 protected:
@@ -11419,8 +10355,7 @@ private:
     std::set<packet_id_t> sub_unsub_inflight_;
     bool auto_pub_response_{true};
     bool auto_pub_response_async_{false};
-    bool async_notify_{false};
-    bool async_send_store_{ false };
+    bool async_send_store_ { false };
     bool async_read_on_message_processed_ { true };
     bool disconnect_requested_{false};
     bool connect_requested_{false};
@@ -11444,40 +10379,6 @@ private:
 
     mutable Mutex topic_alias_recv_mtx_;
     optional<topic_alias_recv> topic_alias_recv_;
-
-    std::size_t maximum_packet_size_send_ = packet_size_no_limit;
-    std::size_t maximum_packet_size_recv_ = packet_size_no_limit;
-
-    std::atomic<receive_maximum_t> publish_send_count_{0};
-    receive_maximum_t publish_send_max_ = receive_maximum_max;
-    receive_maximum_t publish_recv_max_ = receive_maximum_max;
-    Mutex publish_received_mtx_;
-    std::set<packet_id_t> publish_received_;
-    struct publish_send_queue_elem {
-        publish_send_queue_elem(
-            basic_message_variant<PacketIdBytes> message,
-            async_handler_t handler,
-            any life_keeper = any()
-        ): message{force_move(message)},
-           life_keeper{force_move(life_keeper)},
-           async{true},
-           handler{force_move(handler)}
-        {}
-        publish_send_queue_elem(
-            basic_message_variant<PacketIdBytes> message,
-            any life_keeper = any()
-        ): message{force_move(message)},
-           life_keeper{force_move(life_keeper)},
-           async{false}
-        {}
-        basic_message_variant<PacketIdBytes> message;
-        any life_keeper;
-        bool async;
-        async_handler_t handler;
-    };
-    Mutex publish_send_queue_mtx_;
-    std::deque<publish_send_queue_elem> publish_send_queue_;
-    std::set<packet_id_t> resend_pubrel_;
 };
 
 } // namespace MQTT_NS

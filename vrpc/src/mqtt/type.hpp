@@ -15,7 +15,6 @@ namespace MQTT_NS {
 
 using session_expiry_interval_t = std::uint32_t;
 using topic_alias_t = std::uint16_t;
-using receive_maximum_t = std::uint16_t;
 
 } // namespace MQTT_NS
 
