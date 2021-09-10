@@ -108,6 +108,10 @@ json_call <- function(object_name,
   )
   if (!is.null(call_id)) {
     on_execution_done(call_id, out)
+    # we are sitting on a detached fork, so have to clean up at some point to
+    # not turn into zombies
+    Sys.sleep(8)
+    quit(save = "no")
   }
   return(out)
 }
