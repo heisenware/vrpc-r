@@ -209,13 +209,15 @@ mqtt::will create_will_message(const Options& options) {
 void on_execution_done(int id, const Rcpp::CharacterVector& cv) {
   vrpc::json j = awaited_callbacks[id];
   awaited_callbacks.erase(id);
-  std::cout << "cv: " << cv << std::endl;
   const std::string ret = Rcpp::as<std::string>(cv);
-  std::cout << "ret: " << ret << std::endl;
   if (ret.size() >= 7 && ret.substr(0, 7) == "__err__") {
     j["data"]["e"] = ret.substr(7);
   } else {
-    j["data"]["r"] = vrpc::json::parse(ret);
+    try {
+      j["data"]["r"] = vrpc::json::parse(ret);
+    } catch (...) {
+      j["data"]["r"] = ret;
+    }
   }
   client->publish(j["sender"].get<std::string>(), j.dump(),
                   mqtt::qos::at_least_once);
@@ -278,14 +280,12 @@ void start_vrpc_agent(const Rcpp::List& args) {
   client->set_publish_handler([&](mqtt::optional<packet_id_t> packet_id,
                              mqtt::publish_options pubopts,
                              mqtt::buffer topic, mqtt::buffer contents) {
-    std::cout << "message received."
-              << " dup: " << pubopts.get_dup() << " qos: " << pubopts.get_qos()
-              << " retain: " << pubopts.get_retain() << std::endl;
-    std::cout << "topic: " << topic << std::endl;
-    std::cout << "contents: " << contents << std::endl;
+    // std::cout << "message received." << std::endl;
+    // std::cout << "topic: " << topic << std::endl;
+    // std::cout << "contents: " << contents << std::endl;
     const auto tokens = tokenize(std::string(topic), "/");
     if (tokens.size() == 4 && tokens[3] == "__clientInfo__") {
-      std::cout << "received clientInfo" << std::endl;
+      // std::cout << "received clientInfo" << std::endl;
       return true;
     }
     if (tokens.size() != 5) {
