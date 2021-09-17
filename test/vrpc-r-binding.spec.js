@@ -200,5 +200,10 @@ describe('VRPC R-Agent', () => {
       ])
       assert.deepStrictEqual(carRow, [{ dist: 2, speed: 4 }])
     })
+    it('should delete proxies', async () => {
+      const ret = await client.delete('session1')
+      assert.strictEqual(ret, true)
+      assert.rejects(async () => await proxy1.get_table(1))
+    })
   })
 })
