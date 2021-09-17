@@ -265,6 +265,8 @@ void start_vrpc_agent(const Rcpp::List& args) {
                                        "/Session/__static__/");
           client->subscribe(base_topic + "__createNamed__",
                             mqtt::qos::at_least_once);
+          client->subscribe(base_topic + "__delete__",
+                            mqtt::qos::at_least_once);
           client->subscribe(base_topic + "call", mqtt::qos::at_least_once);
           for (const auto& x : options.functions) {
             client->subscribe(base_topic + x, mqtt::qos::at_least_once);
@@ -339,7 +341,31 @@ void start_vrpc_agent(const Rcpp::List& args) {
           j["data"]["r"] = new_instance;
           client->publish(j["sender"].get<std::string>(), j.dump(),
                       mqtt::qos::at_least_once);
-        } else {
+        } else if (method == "__delete__") {
+          // instance deletion
+          std::string del_instance;
+          for (const auto& x : data.items()) {
+            if (x.key() == "_1")
+              del_instance = x.value();
+            else
+              args.push_back(x.value());
+          }
+          client->unsubscribe(options.domain + "/" + options.agent + "/Session/" +
+                       del_instance + "/+");
+          auto it = std::find(std::begin(instances), std::end(instances), del_instance);
+          if (it != std::end(instances)) {
+            instances.erase(it);
+            publish_class_info(client, options);
+            j["data"]["r"] = true;
+            client->publish(j["sender"].get<std::string>(), j.dump(),
+                      mqtt::qos::at_least_once);
+          } else {
+            j["data"]["r"] = false;
+            client->publish(j["sender"].get<std::string>(), j.dump(),
+                      mqtt::qos::at_least_once);
+          }
+        }
+        else {
           // specific function call
           for (const auto& x : data.items()) {
             args.push_back(x.value());
