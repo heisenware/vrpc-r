@@ -1,15 +1,16 @@
 
 // [[Rcpp::depends(BH)]]
 
+#include <bitset>
 #include <iomanip>
 #include <iostream>
 #include <map>
-#include <bitset>
 
 #include <Rcpp.h>
 #include <json.hpp>
 #include <mqtt_client_cpp.hpp>
-#include <mqtt/setup_log.hpp>
+
+#define VRPC_PROTOCOL_VERSION 3
 
 using namespace std::chrono_literals;
 
@@ -124,6 +125,7 @@ void publish_agent_info(const T& client, const Options& options) {
   j["status"] = "online";
   j["hostname"] = get_hostname();
   j["version"] = options.version;
+  j["v"] = VRPC_PROTOCOL_VERSION;
   const std::string topic(options.domain + "/" + options.agent +
                           "/__agentInfo__");
   client->publish(topic, j.dump(),
@@ -135,7 +137,7 @@ void publish_class_info(const T& client, const Options& options) {
   vrpc::json j;
   j["className"] = "Session";
   j["instances"] = instances;
-  std::vector<std::string> s{"__createNamed__", "call"};
+  std::vector<std::string> s{"__createShared__", "call"};
   s.insert(std::end(s), std::begin(options.functions),
            std::end(options.functions));
   j["staticFunctions"] = s;
@@ -144,6 +146,7 @@ void publish_class_info(const T& client, const Options& options) {
            std::end(options.functions));
   j["memberFunctions"] = m;
   j["meta"] = vrpc::json(nullptr);
+  j["v"] = VRPC_PROTOCOL_VERSION;
   const std::string topic(options.domain + "/" + options.agent +
                           "/Session/__classInfo__");
   client->publish(topic, j.dump(),
@@ -152,8 +155,8 @@ void publish_class_info(const T& client, const Options& options) {
 
 std::string generate_client_id(const Options& options) {
   const std::string tmp = options.domain + options.agent;
-  std::to_string(std::hash<std::string>{}(tmp)).substr(0, 18);
-  return "vrpca" + std::to_string(std::hash<std::string>{}(tmp)).substr(0, 18);
+  std::to_string(std::hash<std::string>{}(tmp)).substr(0, 20);
+  return "va3" + std::to_string(std::hash<std::string>{}(tmp)).substr(0, 20);
 }
 
 std::string generate_agent_name() {
@@ -196,11 +199,11 @@ Options parse_arguments(const Rcpp::List& args) {
 
 mqtt::will create_will_message(const Options& options) {
   return {mqtt::allocate_buffer(options.domain + "/" + options.agent +
-                                   "/__agentInfo__"),
-          mqtt::allocate_buffer(vrpc::json{
-              {"status", "offline"},
-              {"hostname",
-               get_hostname()}}.dump()),
+                                "/__agentInfo__"),
+          mqtt::allocate_buffer(vrpc::json{{"status", "offline"},
+                                           {"hostname", get_hostname()},
+                                           {"v", VRPC_PROTOCOL_VERSION}}
+                                    .dump()),
 
           mqtt::qos::at_least_once | mqtt::retain::yes};
 }
@@ -211,21 +214,20 @@ void on_execution_done(int id, const Rcpp::CharacterVector& cv) {
   awaited_callbacks.erase(id);
   const std::string ret = Rcpp::as<std::string>(cv);
   if (ret.size() >= 7 && ret.substr(0, 7) == "__err__") {
-    j["data"]["e"] = ret.substr(7);
+    j["e"] = ret.substr(7);
   } else {
     try {
-      j["data"]["r"] = vrpc::json::parse(ret);
+      j["r"] = vrpc::json::parse(ret);
     } catch (...) {
-      j["data"]["r"] = ret;
+      j["r"] = ret;
     }
   }
-  client->publish(j["sender"].get<std::string>(), j.dump(),
+  client->publish(j["s"].get<std::string>(), j.dump(),
                   mqtt::qos::at_least_once);
 }
 
 // [[Rcpp::export]]
 void start_vrpc_agent(const Rcpp::List& args) {
-
   // this function is implemented in R (Adapter.R) and we will call it from C++
   Rcpp::Function vrpc_call("vrpc_call");
 
@@ -251,7 +253,9 @@ void start_vrpc_agent(const Rcpp::List& args) {
       mqtt::will(mqtt::allocate_buffer(options.domain + "/" + options.agent +
                                        "/__agentInfo__"),
                  mqtt::allocate_buffer(vrpc::json{{"status", "offline"},
-                                                  {"hostname", get_hostname()}}
+                                                  {"hostname", get_hostname()},
+                                                  "v",
+                                                  VRPC_PROTOCOL_VERSION}
                                            .dump()),
                  mqtt::qos::at_least_once | mqtt::retain::yes));
 
@@ -263,7 +267,7 @@ void start_vrpc_agent(const Rcpp::List& args) {
           publish_agent_info(client, options);
           const std::string base_topic(options.domain + "/" + options.agent +
                                        "/Session/__static__/");
-          client->subscribe(base_topic + "__createNamed__",
+          client->subscribe(base_topic + "__createShared__",
                             mqtt::qos::at_least_once);
           client->subscribe(base_topic + "__delete__",
                             mqtt::qos::at_least_once);
@@ -280,8 +284,8 @@ void start_vrpc_agent(const Rcpp::List& args) {
     std::cout << "error: " << ec.message() << std::endl;
   });
   client->set_publish_handler([&](mqtt::optional<packet_id_t> packet_id,
-                             mqtt::publish_options pubopts,
-                             mqtt::buffer topic, mqtt::buffer contents) {
+                                  mqtt::publish_options pubopts,
+                                  mqtt::buffer topic, mqtt::buffer contents) {
     // std::cout << "message received." << std::endl;
     // std::cout << "topic: " << topic << std::endl;
     // std::cout << "contents: " << contents << std::endl;
@@ -299,100 +303,80 @@ void start_vrpc_agent(const Rcpp::List& args) {
       // extract RPC information from topic structure
       const std::string class_name = tokens[2];
       const std::string instance = tokens[3];
-      const std::string method = tokens[4];
+      const std::string function = tokens[4];
 
       // prepare json for sending back
-      j["context"] = instance == "__static__" ? class_name : instance;
-      j["method"] = method;
+      j["c"] = instance == "__static__" ? class_name : instance;
+      j["f"] = function;
 
       // register next asynchronous R call
       call_id++;
       awaited_callbacks[call_id] = j;
 
       // RPC arguments
-      vrpc::json args(vrpc::json::array());
-      const vrpc::json& data = j["data"];
+      vrpc::json args = j["a"];
 
       // -- static function --
       if (instance == "__static__") {
-        if (method == "call") {
-          // generic call
-          std::string r_function;
-          for (const auto& x : data.items()) {
-            if (x.key() == "_1")
-              r_function = x.value();
-            else
-              args.push_back(x.value());
+        if (function == "call") {
+          // generic call, first argument encodes R function name
+          std::string r_function = args[0];
+          vrpc::json r_args(vrpc::json::array());
+          for (size_t i = 1; i < args.size(); ++i) {
+            r_args.push_back(args[i]);
           }
-          vrpc_call(r_function, args.dump(), call_id);
-        } else if (method == "__createNamed__") {
-          // instance creation
-          std::string new_instance;
-          for (const auto& x : data.items()) {
-            if (x.key() == "_1")
-              new_instance = x.value();
-            else
-              args.push_back(x.value());
-          }
+          vrpc_call(r_function, r_args.dump(), call_id);
+        } else if (function == "__createShared__") {
+          // instance creation, first argument encodes instance name
+          // instances will always be of Session class, further args are ignored
+          const std::string new_instance = args[0].get<std::string>();
           client->subscribe(options.domain + "/" + options.agent + "/Session/" +
-                       new_instance + "/+", mqtt::qos::at_least_once);
+                                new_instance + "/+",
+                            mqtt::qos::at_least_once);
           instances.push_back(new_instance);
           publish_class_info(client, options);
-          j["data"]["r"] = new_instance;
-          client->publish(j["sender"].get<std::string>(), j.dump(),
-                      mqtt::qos::at_least_once);
-        } else if (method == "__delete__") {
-          // instance deletion
-          std::string del_instance;
-          for (const auto& x : data.items()) {
-            if (x.key() == "_1")
-              del_instance = x.value();
-            else
-              args.push_back(x.value());
-          }
-          client->unsubscribe(options.domain + "/" + options.agent + "/Session/" +
-                       del_instance + "/+");
-          auto it = std::find(std::begin(instances), std::end(instances), del_instance);
+          j["r"] = new_instance;
+          client->publish(j["s"].get<std::string>(), j.dump(),
+                          mqtt::qos::at_least_once);
+        } else if (function == "__delete__") {
+          // instance deletion, first argument encodes instance name
+          const std::string del_instance = args[0].get<std::string>();
+          client->unsubscribe(options.domain + "/" + options.agent +
+                              "/Session/" + del_instance + "/+");
+          auto it = std::find(std::begin(instances), std::end(instances),
+                              del_instance);
           if (it != std::end(instances)) {
             instances.erase(it);
             publish_class_info(client, options);
-            j["data"]["r"] = true;
-            client->publish(j["sender"].get<std::string>(), j.dump(),
-                      mqtt::qos::at_least_once);
+            j["r"] = true;
+            client->publish(j["s"].get<std::string>(), j.dump(),
+                            mqtt::qos::at_least_once);
           } else {
-            j["data"]["r"] = false;
-            client->publish(j["sender"].get<std::string>(), j.dump(),
-                      mqtt::qos::at_least_once);
+            j["r"] = false;
+            client->publish(j["s"].get<std::string>(), j.dump(),
+                            mqtt::qos::at_least_once);
           }
-        }
-        else {
+        } else {
           // specific function call
-          for (const auto& x : data.items()) {
-            args.push_back(x.value());
-          }
-          vrpc_call(method, args.dump(), call_id);
+          vrpc_call(function, args.dump(), call_id);
         }
       } else {
         // -- member function --
-        if (method == "call") {
-          // generic call
-          std::string r_function;
-          for (const auto& x : data.items()) {
-            if (x.key() == "_1") r_function = x.value();
-            else args.push_back(x.value());
+        if (function == "call") {
+          // generic call, first argument encodes R function name
+          std::string r_function = args[0];
+          vrpc::json r_args(vrpc::json::array());
+          for (size_t i = 1; i < args.size(); ++i) {
+            r_args.push_back(args[i]);
           }
-          vrpc_call(r_function, args.dump(), call_id, instance);
+          vrpc_call(r_function, r_args.dump(), call_id, instance);
         } else {
-          for (const auto& x : data.items()) {
-            args.push_back(x.value());
-          }
-          vrpc_call(method, args.dump(), call_id, instance);
+          vrpc_call(function, args.dump(), call_id, instance);
         }
       }
     } catch (const std::exception& e) {
-      j["data"]["e"] =
-          "Error while calling remote function: " + std::string(e.what());
-      client->publish(j["sender"].get<std::string>(), j.dump(),
+      j["e"] = "Error while calling remote function: " + std::string(e.what());
+      client->publish(j["s"].get<std::string>(), j.dump(),
                       mqtt::qos::at_least_once);
     };
     return true;
@@ -403,10 +387,12 @@ void start_vrpc_agent(const Rcpp::List& args) {
 
   // Disconnect (Ctrl-C)
   shutdown_handler = [&]() {
-    client->publish(
-        options.domain + "/" + options.agent + "/__agentInfo__",
-        vrpc::json{{"status", "offline"}, {"hostname", get_hostname()}}.dump(),
-        mqtt::qos::at_least_once | mqtt::retain::yes);
+    client->publish(options.domain + "/" + options.agent + "/__agentInfo__",
+                    vrpc::json{{"status", "offline"},
+                               {"hostname", get_hostname()},
+                               {"v", VRPC_PROTOCOL_VERSION}}
+                        .dump(),
+                    mqtt::qos::at_least_once | mqtt::retain::yes);
     client->disconnect(3s);
   };
   std::signal(SIGINT, [](int) { shutdown_handler(); });

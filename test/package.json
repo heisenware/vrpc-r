@@ -10,6 +10,6 @@
   "license": "ISC",
   "dependencies": {
     "mocha": "^9.1.0",
-    "vrpc": "^2.6.0"
+    "vrpc": "github:heisenware/vrpc#master"
   }
 }
