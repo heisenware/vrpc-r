@@ -1,13 +1,13 @@
 'use strict'
 
 /* global describe, context, before, after, it */
-const { VrpcRemote } = require('vrpc')
+const { VrpcClient } = require('vrpc')
 const assert = require('assert')
 
 describe('VRPC R-Agent', () => {
   let client
   before(async () => {
-    client = new VrpcRemote({
+    client = new VrpcClient({
       broker: 'mqtt://broker:1883',
       domain: 'test',
       agent: 'agent1'
@@ -57,7 +57,7 @@ describe('VRPC R-Agent', () => {
         err => {
           assert.strictEqual(
             err.message,
-            'could not find function "does_not_exist"'
+            '[vrpc agent1-Session-call]: could not find function "does_not_exist"'
           )
           return true
         }
@@ -74,7 +74,7 @@ describe('VRPC R-Agent', () => {
         err => {
           assert.strictEqual(
             err.message,
-            'argument "n" is missing, with no default'
+            '[vrpc agent1-Session-call]: argument "n" is missing, with no default'
           )
           return true
         }
@@ -151,7 +151,7 @@ describe('VRPC R-Agent', () => {
   describe('Member function calls', () => {
     let proxy1
     let proxy2
-    it('should allow to create named instances', async () => {
+    it('should allow to create shared instances', async () => {
       proxy1 = await client.create({
         className: 'Session',
         instance: 'session1'
